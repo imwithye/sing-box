@@ -96,7 +96,8 @@ emit_config_tpl() {
     "servers": [
       {
         "tag": "cloudflare-doh",
-        "address": "https://1.1.1.1/dns-query",
+        "type": "https",
+        "server": "1.1.1.1",
         "detour": "direct"
       }
     ],
