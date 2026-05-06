@@ -156,7 +156,7 @@ emit_config_tpl() {
           "default_server_name": "${DOMAIN}",
           "email": "${ACME_EMAIL}",
           "dns01_challenge": {
-            "type": "cloudflare",
+            "provider": "cloudflare",
             "api_token": "${CF_API_TOKEN}"
           }
         }
