@@ -68,11 +68,11 @@ upgrade   pull the latest sing-box release + restart
 /etc/systemd/system/sing-box.service
 /etc/sing-box/env               secrets (mode 0600)
 /etc/sing-box/config.json       rendered sing-box config (0640)
-/opt/sing-box/cache/            ACME certs + sing-box runtime state
-/opt/sing-box/client/           subscription.{txt,b64}
+/etc/sing-box/cache/            ACME certs + sing-box runtime state
+/etc/sing-box/client/           subscription.{txt,b64}
 ```
 
-`$SINGBOX_CONFIG_DIR` and `$SINGBOX_DATA_DIR` relocate the two roots.
+`$SINGBOX_CONFIG_DIR` relocates the entire `/etc/sing-box` tree.
 
 ## Hand off to a client
 
@@ -84,9 +84,9 @@ sudo sing-box-ctl share              # prints links + QR + writes subscription.{
   `apt install qrencode`) or paste the printed links into your client
   (Shadowrocket, sing-box, etc.). Group them as `url-test` for automatic
   failover.
-- **Subscribe URL**: host `/opt/sing-box/client/subscription.b64` at an
+- **Subscribe URL**: host `/etc/sing-box/client/subscription.b64` at an
   unguessable URL (e.g.
-  `gh gist create --secret /opt/sing-box/client/subscription.b64`) and
+  `gh gist create --secret /etc/sing-box/client/subscription.b64`) and
   point the client → Subscribe at the file's Raw URL. Re-run
   `sudo sing-box-ctl share` and update the host file to push new creds
   to all devices. Treat the URL like a credential.

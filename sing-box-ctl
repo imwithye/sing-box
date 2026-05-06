@@ -12,10 +12,10 @@ REPO_DL="${SINGBOX_REPO_DL:-https://github.com/SagerNet/sing-box}"
 
 # ─── paths ──────────────────────────────────────────────────────────────────
 CONFIG_DIR="${SINGBOX_CONFIG_DIR:-/etc/sing-box}"
-DATA_DIR="${SINGBOX_DATA_DIR:-/opt/sing-box}"
-
 ENV_FILE="$CONFIG_DIR/env"
 CONFIG_FILE="$CONFIG_DIR/config.json"
+CACHE_DIR="$CONFIG_DIR/cache"
+CLIENT_DIR="$CONFIG_DIR/client"
 UNIT_FILE="/etc/systemd/system/sing-box.service"
 SINGBOX_BIN="/usr/local/bin/sing-box"
 WRAPPER_BIN="/usr/local/bin/sing-box-ctl"
@@ -197,7 +197,7 @@ RestartSec=5
 TimeoutStopSec=20
 LimitNOFILE=infinity
 AmbientCapabilities=CAP_NET_BIND_SERVICE
-ReadWritePaths=$DATA_DIR $CONFIG_DIR
+ReadWritePaths=$CONFIG_DIR
 ProtectSystem=strict
 ProtectHome=true
 NoNewPrivileges=true
@@ -297,9 +297,18 @@ latest_version() {
 install_singbox_binary() {
   require_cmd curl
   require_cmd tar
-  local version arch tarball url tmp
+  local version arch tarball url tmp current
   version="${1:-$(latest_version)}"
   [[ -n "$version" ]] || die "could not determine latest sing-box release"
+
+  if [[ -x "$SINGBOX_BIN" ]]; then
+    current="$("$SINGBOX_BIN" version 2>/dev/null | awk '/sing-box version/ {print $3}')"
+    if [[ "$current" == "$version" ]]; then
+      ok "sing-box ${version} already installed — skipping download"
+      return 0
+    fi
+  fi
+
   arch="$(detect_arch)"
   tarball="sing-box-${version}-linux-${arch}.tar.gz"
   url="$REPO_DL/releases/download/v${version}/${tarball}"
@@ -391,10 +400,10 @@ setup_ufw() {
 # ─── render config ──────────────────────────────────────────────────────────
 render_config() {
   require_cmd envsubst
-  mkdir -p "$CONFIG_DIR" "$DATA_DIR/cache" "$DATA_DIR/client"
+  mkdir -p "$CONFIG_DIR" "$CACHE_DIR" "$CLIENT_DIR"
   chmod 0750 "$CONFIG_DIR"
   step "Rendering $CONFIG_FILE"
-  ACME_DATA_DIR="$DATA_DIR/cache/acme" \
+  ACME_DATA_DIR="$CACHE_DIR/acme" \
     envsubst < <(emit_config_tpl) > "$CONFIG_FILE"
   chmod 0640 "$CONFIG_FILE"
   step "Validating config"
@@ -594,17 +603,17 @@ cmd_share() {
   require_vars "${CLIENT_VARS[@]}"
   build_share_links "${1:-SG}"
 
-  mkdir -p "$DATA_DIR/client"
-  printf "%s\n%s\n" "$VLESS_LINK" "$HY2_LINK" > "$DATA_DIR/client/subscription.txt"
+  mkdir -p "$CLIENT_DIR"
+  printf "%s\n%s\n" "$VLESS_LINK" "$HY2_LINK" > "$CLIENT_DIR/subscription.txt"
   printf "%s\n%s\n" "$VLESS_LINK" "$HY2_LINK" \
-    | base64 -w0 > "$DATA_DIR/client/subscription.b64"
-  chmod 0640 "$DATA_DIR/client/subscription."*
+    | base64 -w0 > "$CLIENT_DIR/subscription.b64"
+  chmod 0640 "$CLIENT_DIR/subscription."*
 
   header "Share links"
   printf '%sVLESS-REALITY%s\n%s\n\n' "$C_BOLD" "$C_RESET" "$VLESS_LINK"
   printf '%sHYSTERIA2%s\n%s\n'       "$C_BOLD" "$C_RESET" "$HY2_LINK"
   echo
-  hint "wrote $DATA_DIR/client/subscription.{txt,b64}"
+  hint "wrote $CLIENT_DIR/subscription.{txt,b64}"
 
   if command -v qrencode >/dev/null; then
     header "QR codes"
@@ -617,8 +626,8 @@ cmd_share() {
   fi
 
   header "Subscribe URL (optional)"
-  hint "host $DATA_DIR/client/subscription.b64 at an unguessable URL — e.g."
-  hint "    gh gist create --secret $DATA_DIR/client/subscription.b64"
+  hint "host $CLIENT_DIR/subscription.b64 at an unguessable URL — e.g."
+  hint "    gh gist create --secret $CLIENT_DIR/subscription.b64"
   hint "then point Shadowrocket → Subscribe at the file's Raw URL."
 }
 
@@ -673,8 +682,7 @@ usage() {
   row "upgrade"        "Pull latest sing-box release + restart"
 
   header "Paths"
-  hint "config: $CONFIG_DIR    (override \$SINGBOX_CONFIG_DIR)"
-  hint "data:   $DATA_DIR    (override \$SINGBOX_DATA_DIR)"
+  hint "root: $CONFIG_DIR    (override \$SINGBOX_CONFIG_DIR)"
 
   header "Examples"
   hint "curl -fsSL https://raw.githubusercontent.com/imwithye/sing-box/main/install.sh | sudo bash"
