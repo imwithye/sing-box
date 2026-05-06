@@ -21,7 +21,7 @@ plugin.
 
 ```
 /usr/local/bin/singbox          wrapper script (this repo)
-/usr/local/bin/sing-box         upstream binary (downloaded by `install`)
+/usr/local/bin/sing-box         upstream binary (downloaded by `setup`)
 /etc/systemd/system/sing-box.service
 /etc/sing-box/env               secrets (mode 0600)
 /etc/sing-box/config.json       rendered sing-box config (0640)
@@ -48,11 +48,10 @@ That's the whole bootstrap. It will:
 5. Drop a `/etc/sing-box/env` template (or, if you pre-seeded it via
    cloud-init, generate the missing secrets and start the service).
 
-After installation:
+After installation (when env wasn't pre-seeded):
 
 ```bash
 sudo vim /etc/sing-box/env        # set DOMAIN, ACME_EMAIL, CF_API_TOKEN
-sudo singbox init                 # generate REALITY/Hy2 secrets (idempotent)
 sudo singbox up                   # render config + (re)start service
 sudo singbox logs                 # follow journald output
 ```
@@ -83,12 +82,11 @@ is done you can `sudo singbox share` over SSH to grab the subscription.
 
 ## Day-to-day
 
-Six commands, all root-only:
+Seven commands, all root-only:
 
 ```
-install   one-shot: BBR+UFW + sing-box binary + systemd unit + wrapper
-setup     re-run host prep only (BBR + UFW)
-init      fill missing secrets in /etc/sing-box/env
+setup     install everything (BBR + UFW + sing-box binary + unit + wrapper +
+          secret generation; runs `up` automatically if env file is complete)
 up        render config + (re)start service
 down      stop service
 logs      journalctl -fu sing-box
@@ -97,8 +95,9 @@ share     print links + QR; write /opt/sing-box/client/subscription.{txt,b64}
 upgrade   pull latest sing-box release + restart
 ```
 
-Updating sing-box: `sudo singbox upgrade`. Updating the wrapper itself:
-`curl -fsSL .../install.sh | sudo bash` again — `install` is idempotent.
+`setup` is idempotent — re-running it upgrades the wrapper and the unit
+in place, and only generates secrets that are still empty. To upgrade
+sing-box without touching anything else: `sudo singbox upgrade`.
 
 If you change `VLESS_UUID`, `REALITY_*`, or `HYSTERIA2_*` in
 `/etc/sing-box/env`, every existing client must be re-imported. Treat

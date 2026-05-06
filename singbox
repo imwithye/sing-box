@@ -411,9 +411,50 @@ build_share_links() {
 }
 
 # ─── subcommands ────────────────────────────────────────────────────────────
-cmd_install() {
-  require_root install
-  header "sing-box deployment installer"
+# Returns 0 if DOMAIN, ACME_EMAIL, CF_API_TOKEN are set + non-empty in $ENV_FILE.
+env_has_required() {
+  local v
+  for v in DOMAIN ACME_EMAIL CF_API_TOKEN; do
+    grep -q "^${v}=..*$" "$ENV_FILE" || return 1
+  done
+  return 0
+}
+
+# Idempotent: fills empty REALITY / VLESS / Hy2 secrets in $ENV_FILE.
+fill_secrets() {
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  local changed=0
+
+  if [[ -z "${VLESS_UUID:-}" ]]; then
+    set_env VLESS_UUID "$(gen_uuid)"; ok "VLESS_UUID generated"; changed=1
+  fi
+  if [[ -z "${REALITY_PRIVATE_KEY:-}" || -z "${REALITY_PUBLIC_KEY:-}" ]]; then
+    local kp
+    kp="$(gen_reality_keypair)"
+    set_env REALITY_PRIVATE_KEY "$(awk '/PrivateKey/ {print $2}' <<< "$kp")"
+    set_env REALITY_PUBLIC_KEY  "$(awk '/PublicKey/  {print $2}' <<< "$kp")"
+    ok "REALITY keypair generated"; changed=1
+  fi
+  if [[ -z "${REALITY_SHORT_ID:-}" ]]; then
+    set_env REALITY_SHORT_ID "$(gen_short_id)"
+    ok "REALITY_SHORT_ID generated"; changed=1
+  fi
+  if [[ -z "${HYSTERIA2_PASSWORD:-}" ]]; then
+    set_env HYSTERIA2_PASSWORD "$(gen_password)"
+    ok "HYSTERIA2_PASSWORD generated"; changed=1
+  fi
+  if [[ -z "${HYSTERIA2_OBFS_PASSWORD:-}" ]]; then
+    set_env HYSTERIA2_OBFS_PASSWORD "$(gen_password)"
+    ok "HYSTERIA2_OBFS_PASSWORD generated"; changed=1
+  fi
+
+  (( changed == 0 )) && ok "all secrets already populated"
+}
+
+cmd_setup() {
+  require_root setup
+  header "sing-box deployment setup"
   detect_os
   ok "$OS_PRETTY"
 
@@ -434,99 +475,31 @@ cmd_install() {
     ok "wrapper already at $WRAPPER_BIN"
   fi
 
-  if [[ -f "$ENV_FILE" ]] && env_has_required; then
-    header "Found pre-seeded $ENV_FILE — completing setup"
-    cmd_init  # fills missing secrets idempotently
+  header "Configuring $ENV_FILE"
+  if [[ ! -f "$ENV_FILE" ]]; then
+    mkdir -p "$CONFIG_DIR"
+    chmod 0750 "$CONFIG_DIR"
+    emit_env_example > "$ENV_FILE"
+    chmod 0600 "$ENV_FILE"
+    ok "wrote $ENV_FILE template"
+  else
+    ok "$ENV_FILE already exists"
+  fi
+  fill_secrets
+
+  if env_has_required; then
+    header "env file complete — bringing up service"
     cmd_up
-    return 0
+  else
+    header "Next steps"
+    hint "1. edit $ENV_FILE — set DOMAIN, ACME_EMAIL, CF_API_TOKEN"
+    hint "2. sudo singbox up"
   fi
-
-  if [[ ! -f "$ENV_FILE" ]]; then
-    header "Writing $ENV_FILE template"
-    mkdir -p "$CONFIG_DIR"
-    chmod 0750 "$CONFIG_DIR"
-    emit_env_example > "$ENV_FILE"
-    chmod 0600 "$ENV_FILE"
-    ok "wrote $ENV_FILE"
-  fi
-
-  header "Next steps"
-  hint "1. edit $ENV_FILE — set DOMAIN, ACME_EMAIL, CF_API_TOKEN"
-  hint "2. sudo singbox init      # generate REALITY/Hy2 secrets"
-  hint "3. sudo singbox up        # render config + start service"
-}
-
-env_has_required() {
-  # Returns 0 if DOMAIN, ACME_EMAIL, CF_API_TOKEN are set in $ENV_FILE.
-  local v
-  for v in DOMAIN ACME_EMAIL CF_API_TOKEN; do
-    grep -q "^${v}=..*$" "$ENV_FILE" || return 1
-  done
-  return 0
-}
-
-cmd_setup() {
-  require_root setup
-  detect_os
-  header "sing-box host prep"
-  ok "$OS_PRETTY"
-  setup_bbr || warn "BBR setup did not complete"
-  setup_ufw
-}
-
-cmd_init() {
-  require_root init
-  [[ -x "$SINGBOX_BIN" ]] || die "sing-box binary missing — run 'singbox install' first"
-
-  if [[ ! -f "$ENV_FILE" ]]; then
-    mkdir -p "$CONFIG_DIR"
-    chmod 0750 "$CONFIG_DIR"
-    emit_env_example > "$ENV_FILE"
-    chmod 0600 "$ENV_FILE"
-  fi
-
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-
-  header "Generating secrets in $ENV_FILE"
-
-  if [[ -z "${VLESS_UUID:-}" ]]; then
-    step "VLESS UUID"
-    set_env VLESS_UUID "$(gen_uuid)"
-    ok "set"
-  fi
-  if [[ -z "${REALITY_PRIVATE_KEY:-}" || -z "${REALITY_PUBLIC_KEY:-}" ]]; then
-    step "REALITY keypair"
-    local kp
-    kp="$(gen_reality_keypair)"
-    set_env REALITY_PRIVATE_KEY "$(awk '/PrivateKey/ {print $2}' <<< "$kp")"
-    set_env REALITY_PUBLIC_KEY  "$(awk '/PublicKey/  {print $2}' <<< "$kp")"
-    ok "set"
-  fi
-  if [[ -z "${REALITY_SHORT_ID:-}" ]]; then
-    step "REALITY short ID"
-    set_env REALITY_SHORT_ID "$(gen_short_id)"
-    ok "set"
-  fi
-  if [[ -z "${HYSTERIA2_PASSWORD:-}" ]]; then
-    step "Hysteria2 password"
-    set_env HYSTERIA2_PASSWORD "$(gen_password)"
-    ok "set"
-  fi
-  if [[ -z "${HYSTERIA2_OBFS_PASSWORD:-}" ]]; then
-    step "Hysteria2 obfs password"
-    set_env HYSTERIA2_OBFS_PASSWORD "$(gen_password)"
-    ok "set"
-  fi
-
-  header "Next steps"
-  hint "1. confirm $ENV_FILE has DOMAIN, ACME_EMAIL, CF_API_TOKEN"
-  hint "2. sudo singbox up"
 }
 
 cmd_up() {
   require_root up
-  [[ -x "$SINGBOX_BIN" ]] || die "sing-box binary missing — run 'singbox install' first"
+  [[ -x "$SINGBOX_BIN" ]] || die "sing-box binary missing — run 'singbox setup' first"
   load_env
   require_vars "${SERVER_VARS[@]}"
   render_config
@@ -633,9 +606,7 @@ usage() {
   hint "sudo singbox <command> [args]"
 
   header "Commands"
-  row "install"        "One-shot: BBR+UFW, sing-box binary, systemd unit, wrapper"
-  row "setup"          "Re-run host prep only (BBR + UFW)"
-  row "init"           "Fill missing secrets in $ENV_FILE"
+  row "setup"          "Install everything: BBR+UFW, sing-box binary, unit, wrapper, secrets"
   row "up"             "Render config + (re)start service"
   row "down"           "Stop service"
   row "logs"           "journalctl -fu sing-box"
@@ -656,9 +627,7 @@ usage() {
 
 main() {
   case "${1:-}" in
-    install)            shift; cmd_install "$@" ;;
     setup)              shift; cmd_setup   "$@" ;;
-    init)               shift; cmd_init    "$@" ;;
     up)                 shift; cmd_up      "$@" ;;
     down)               shift; cmd_down    "$@" ;;
     logs)               shift; cmd_logs    "$@" ;;

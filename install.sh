@@ -36,4 +36,4 @@ trap "rm -f '$tmp'" EXIT
 curl -fsSL "$WRAPPER_URL" -o "$tmp"
 
 install -m 0755 "$tmp" "$WRAPPER_BIN"
-exec "$WRAPPER_BIN" install
+exec "$WRAPPER_BIN" setup
