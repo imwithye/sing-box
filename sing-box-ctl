@@ -219,8 +219,7 @@ load_env() {
 set_env() {
   local key="$1" val="$2"
   if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
-    sed -i.bak "s|^${key}=.*|${key}=${val}|" "$ENV_FILE"
-    rm -f "${ENV_FILE}.bak"
+    sed -i "s|^${key}=.*|${key}=${val}|" "$ENV_FILE"
   else
     printf '%s=%s\n' "$key" "$val" >> "$ENV_FILE"
   fi
@@ -294,19 +293,21 @@ latest_version() {
     | sed -E 's/.*"v([^"]+)".*/\1/'
 }
 
+installed_version() {
+  [[ -x "$SINGBOX_BIN" ]] || return 0
+  "$SINGBOX_BIN" version 2>/dev/null | awk '/sing-box version/ {print $3}'
+}
+
 install_singbox_binary() {
   require_cmd curl
   require_cmd tar
-  local version arch tarball url tmp current
+  local version arch tarball url tmp
   version="${1:-$(latest_version)}"
   [[ -n "$version" ]] || die "could not determine latest sing-box release"
 
-  if [[ -x "$SINGBOX_BIN" ]]; then
-    current="$("$SINGBOX_BIN" version 2>/dev/null | awk '/sing-box version/ {print $3}')"
-    if [[ "$current" == "$version" ]]; then
-      ok "sing-box ${version} already installed — skipping download"
-      return 0
-    fi
+  if [[ "$(installed_version)" == "$version" ]]; then
+    ok "sing-box ${version} already installed — skipping download"
+    return 0
   fi
 
   arch="$(detect_arch)"
@@ -319,7 +320,7 @@ install_singbox_binary() {
   tar xzf "$tmp/sb.tgz" -C "$tmp"
   install -m 0755 "$tmp/sing-box-${version}-linux-${arch}/sing-box" "$SINGBOX_BIN"
   rm -rf "$tmp"
-  ok "installed $SINGBOX_BIN ($("$SINGBOX_BIN" version | head -n1))"
+  ok "installed $SINGBOX_BIN (sing-box $version)"
 }
 
 install_systemd_unit() {
@@ -373,6 +374,8 @@ EOF
   ok "BBR active"
 }
 
+ufw_allow() { ufw allow "$1" comment "$2" >/dev/null; }
+
 setup_ufw() {
   header "UFW firewall"
   if [[ $IS_DEBIAN_LIKE -ne 1 ]]; then
@@ -390,9 +393,9 @@ setup_ufw() {
   fi
   ufw --force default deny incoming  >/dev/null
   ufw --force default allow outgoing >/dev/null
-  ufw allow 22/tcp  comment 'ssh' >/dev/null
-  ufw allow 443/tcp comment 'sing-box vless-reality' >/dev/null
-  ufw allow 443/udp comment 'sing-box hysteria2' >/dev/null
+  ufw_allow 22/tcp  ssh
+  ufw_allow 443/tcp 'sing-box vless-reality'
+  ufw_allow 443/udp 'sing-box hysteria2'
   ufw --force enable >/dev/null
   ok "ufw active (22/tcp, 443/tcp, 443/udp open)"
 }
@@ -455,15 +458,12 @@ configure_var() {
   local fb="${!fb_var:-}"
   if [[ -n "$fb" ]]; then
     set_env "$var" "$fb"
-    # shellcheck disable=SC2034
-    eval "$var=\"\$fb\""
     ok "$var ← (from \$$fb_var)"
     return 0
   fi
 
   # Otherwise keep an existing non-empty env-file value untouched.
-  local current="${!var:-}"
-  [[ -n "$current" ]] && return 0
+  [[ -n "${!var:-}" ]] && return 0
 
   if [[ -e /dev/tty && -r /dev/tty ]]; then
     local value
@@ -472,7 +472,6 @@ configure_var() {
       read -r value </dev/tty || value=""
       if [[ -n "$value" ]]; then
         set_env "$var" "$value"
-        eval "$var=\"\$value\""
         ok "$var set"
         return 0
       fi
@@ -490,29 +489,26 @@ configure_var() {
 fill_secrets() {
   # shellcheck disable=SC1090
   source "$ENV_FILE"
-  local changed=0
+  local changed=0 spec name gen
+  for spec in \
+      VLESS_UUID:gen_uuid \
+      REALITY_SHORT_ID:gen_short_id \
+      HYSTERIA2_PASSWORD:gen_password \
+      HYSTERIA2_OBFS_PASSWORD:gen_password; do
+    name="${spec%%:*}"; gen="${spec#*:}"
+    [[ -n "${!name:-}" ]] && continue
+    set_env "$name" "$($gen)"
+    ok "$name generated"
+    changed=1
+  done
 
-  if [[ -z "${VLESS_UUID:-}" ]]; then
-    set_env VLESS_UUID "$(gen_uuid)"; ok "VLESS_UUID generated"; changed=1
-  fi
   if [[ -z "${REALITY_PRIVATE_KEY:-}" || -z "${REALITY_PUBLIC_KEY:-}" ]]; then
     local kp
     kp="$(gen_reality_keypair)"
     set_env REALITY_PRIVATE_KEY "$(awk '/PrivateKey/ {print $2}' <<< "$kp")"
     set_env REALITY_PUBLIC_KEY  "$(awk '/PublicKey/  {print $2}' <<< "$kp")"
-    ok "REALITY keypair generated"; changed=1
-  fi
-  if [[ -z "${REALITY_SHORT_ID:-}" ]]; then
-    set_env REALITY_SHORT_ID "$(gen_short_id)"
-    ok "REALITY_SHORT_ID generated"; changed=1
-  fi
-  if [[ -z "${HYSTERIA2_PASSWORD:-}" ]]; then
-    set_env HYSTERIA2_PASSWORD "$(gen_password)"
-    ok "HYSTERIA2_PASSWORD generated"; changed=1
-  fi
-  if [[ -z "${HYSTERIA2_OBFS_PASSWORD:-}" ]]; then
-    set_env HYSTERIA2_OBFS_PASSWORD "$(gen_password)"
-    ok "HYSTERIA2_OBFS_PASSWORD generated"; changed=1
+    ok "REALITY keypair generated"
+    changed=1
   fi
 
   (( changed == 0 )) && ok "all secrets already populated"
@@ -571,9 +567,13 @@ cmd_up() {
   require_vars "${SERVER_VARS[@]}"
   render_config
   step "Restarting sing-box"
-  systemctl daemon-reload
   systemctl restart sing-box
-  sleep 1
+  local i
+  for i in {1..20}; do
+    systemctl is-active --quiet sing-box && break
+    systemctl is-failed --quiet sing-box && break
+    sleep 0.25
+  done
   if systemctl is-active --quiet sing-box; then
     ok "sing-box active"
   else
@@ -634,10 +634,7 @@ cmd_share() {
 cmd_upgrade() {
   require_root upgrade
   local current latest
-  current=""
-  if [[ -x "$SINGBOX_BIN" ]]; then
-    current="$("$SINGBOX_BIN" version | awk '/sing-box version/ {print $3}')"
-  fi
+  current="$(installed_version)"
   latest="$(latest_version)"
   header "sing-box upgrade"
   ok "current: ${current:-not installed}"
