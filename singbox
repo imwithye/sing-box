@@ -1,0 +1,673 @@
+#!/usr/bin/env bash
+# singbox — one-binary VLESS+REALITY + Hysteria2 deployment wrapper.
+#
+# Talks straight to the upstream sing-box release binary + a systemd unit.
+# No Docker, no compose plugin, no Go runtime: just bash + curl + systemd.
+
+set -euo pipefail
+
+# ─── repo / upstream ────────────────────────────────────────────────────────
+REPO_API="${SINGBOX_REPO_API:-https://api.github.com/repos/SagerNet/sing-box}"
+REPO_DL="${SINGBOX_REPO_DL:-https://github.com/SagerNet/sing-box}"
+
+# ─── paths ──────────────────────────────────────────────────────────────────
+CONFIG_DIR="${SINGBOX_CONFIG_DIR:-/etc/sing-box}"
+DATA_DIR="${SINGBOX_DATA_DIR:-/opt/sing-box}"
+
+ENV_FILE="$CONFIG_DIR/.env"
+CONFIG_FILE="$CONFIG_DIR/config.json"
+UNIT_FILE="/etc/systemd/system/sing-box.service"
+SINGBOX_BIN="/usr/local/bin/sing-box"
+WRAPPER_BIN="/usr/local/bin/singbox"
+
+# ─── pretty output ──────────────────────────────────────────────────────────
+if [[ -t 1 && "${NO_COLOR:-}" == "" ]]; then
+  C_RESET=$'\033[0m'   C_DIM=$'\033[2m'    C_BOLD=$'\033[1m'
+  C_RED=$'\033[31m'    C_GREEN=$'\033[32m' C_YELLOW=$'\033[33m'
+  C_CYAN=$'\033[36m'
+else
+  C_RESET= C_DIM= C_BOLD= C_RED= C_GREEN= C_YELLOW= C_CYAN=
+fi
+
+header() { printf '\n%s%s━━ %s ━━%s\n' "${C_BOLD}" "${C_CYAN}" "$*" "${C_RESET}"; }
+step()   { printf '%s→%s %s\n'         "${C_CYAN}"   "${C_RESET}" "$*"; }
+ok()     { printf '  %s✓%s %s\n'       "${C_GREEN}"  "${C_RESET}" "$*"; }
+warn()   { printf '  %s⚠%s %s\n'       "${C_YELLOW}" "${C_RESET}" "$*"; }
+hint()   { printf '  %s%s%s\n'         "${C_DIM}"    "$*"        "${C_RESET}"; }
+err()    { printf '%s✗%s %s\n'         "${C_RED}"    "${C_RESET}" "$*" >&2; }
+die()    { err "$*"; exit 1; }
+
+# ─── prerequisites ──────────────────────────────────────────────────────────
+require_root() {
+  [[ $EUID -eq 0 ]] || die "must run as root — try: sudo singbox ${1:-}"
+}
+
+require_cmd() {
+  command -v "$1" >/dev/null 2>&1 || die "$1 not found in PATH"
+}
+
+# ─── embedded templates (heredocs keep this file self-contained) ────────────
+emit_env_example() {
+  cat <<'TPL'
+# ---- Server identity ----------------------------------------------------
+# Domain pointing to this VPS. Cloudflare DNS should be DNS-only (gray cloud)
+# — do not enable the proxy/orange cloud, sing-box protocols don't go through
+# Cloudflare's CDN.
+DOMAIN=
+
+# Email used for Let's Encrypt ACME registration.
+ACME_EMAIL=
+
+# Cloudflare API token for ACME DNS-01.
+# Permissions required:
+#   Zone.DNS         : Edit
+#   Zone.Zone        : Read
+# Scope: include the zone for ${DOMAIN}.
+# Create at: https://dash.cloudflare.com/profile/api-tokens
+CF_API_TOKEN=
+
+# ---- REALITY camouflage --------------------------------------------------
+# Real site whose TLS handshake REALITY will impersonate.
+# Requirements: TLS 1.3, X25519, HTTP/2, reachable from your VPS.
+# Good defaults: www.apple.com, www.cloudflare.com, www.microsoft.com,
+#                addons.mozilla.org, dl.google.com
+REALITY_DEST_SNI=www.apple.com
+REALITY_DEST_PORT=443
+
+# ---- Generated secrets (filled in by `singbox init`) --------------------
+# Do not edit by hand unless you intend to invalidate every existing client.
+VLESS_UUID=
+REALITY_PRIVATE_KEY=
+REALITY_PUBLIC_KEY=
+REALITY_SHORT_ID=
+HYSTERIA2_PASSWORD=
+HYSTERIA2_OBFS_PASSWORD=
+TPL
+}
+
+emit_config_tpl() {
+  cat <<'TPL'
+{
+  "log": {
+    "level": "warn",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "cloudflare-doh",
+        "address": "https://1.1.1.1/dns-query",
+        "detour": "direct"
+      }
+    ],
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-reality",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [
+        {
+          "name": "default",
+          "uuid": "${VLESS_UUID}",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${REALITY_DEST_SNI}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${REALITY_DEST_SNI}",
+            "server_port": ${REALITY_DEST_PORT}
+          },
+          "private_key": "${REALITY_PRIVATE_KEY}",
+          "short_id": ["${REALITY_SHORT_ID}"]
+        }
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "hysteria2",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [
+        {
+          "name": "default",
+          "password": "${HYSTERIA2_PASSWORD}"
+        }
+      ],
+      "obfs": {
+        "type": "salamander",
+        "password": "${HYSTERIA2_OBFS_PASSWORD}"
+      },
+      "masquerade": "https://www.bing.com",
+      "tls": {
+        "enabled": true,
+        "server_name": "${DOMAIN}",
+        "alpn": ["h3"],
+        "acme": {
+          "domain": ["${DOMAIN}"],
+          "data_directory": "${ACME_DATA_DIR}",
+          "default_server_name": "${DOMAIN}",
+          "email": "${ACME_EMAIL}",
+          "dns01_challenge": {
+            "type": "cloudflare",
+            "api_token": "${CF_API_TOKEN}"
+          }
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "ip_is_private": true,
+        "outbound": "direct"
+      }
+    ],
+    "final": "direct"
+  }
+}
+TPL
+}
+
+emit_systemd_unit() {
+  cat <<EOF
+[Unit]
+Description=sing-box (VLESS+REALITY + Hysteria2)
+Documentation=https://github.com/imwithye/sing-box
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$SINGBOX_BIN run -c $CONFIG_FILE
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+LimitNOFILE=infinity
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+ReadWritePaths=$DATA_DIR $CONFIG_DIR
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# ─── env file helpers ───────────────────────────────────────────────────────
+load_env() {
+  [[ -f "$ENV_FILE" ]] || die "$ENV_FILE not found — run 'singbox init' first"
+  set -a; # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+}
+
+set_env() {
+  local key="$1" val="$2"
+  if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
+    sed -i.bak "s|^${key}=.*|${key}=${val}|" "$ENV_FILE"
+    rm -f "${ENV_FILE}.bak"
+  else
+    printf '%s=%s\n' "$key" "$val" >> "$ENV_FILE"
+  fi
+}
+
+require_vars() {
+  local missing=0 v
+  for v in "$@"; do
+    if [[ -z "${!v:-}" ]]; then
+      err "$v is empty in $ENV_FILE"
+      missing=1
+    fi
+  done
+  (( missing == 0 )) || exit 1
+}
+
+# Server vars must be present + non-empty before `up`.
+SERVER_VARS=(
+  DOMAIN ACME_EMAIL CF_API_TOKEN
+  REALITY_DEST_SNI REALITY_DEST_PORT
+  VLESS_UUID
+  REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY REALITY_SHORT_ID
+  HYSTERIA2_PASSWORD HYSTERIA2_OBFS_PASSWORD
+)
+# Client vars are what a Shadowrocket import / share link needs.
+CLIENT_VARS=(
+  DOMAIN REALITY_DEST_SNI VLESS_UUID
+  REALITY_PUBLIC_KEY REALITY_SHORT_ID
+  HYSTERIA2_PASSWORD HYSTERIA2_OBFS_PASSWORD
+)
+
+# ─── secret generators ──────────────────────────────────────────────────────
+gen_uuid() {
+  if [[ -x "$SINGBOX_BIN" ]]; then
+    "$SINGBOX_BIN" generate uuid | tr -d '\r\n'
+  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    die "cannot generate UUID — install sing-box first"
+  fi
+}
+
+gen_reality_keypair() {
+  [[ -x "$SINGBOX_BIN" ]] || die "sing-box binary missing — run 'singbox install' first"
+  "$SINGBOX_BIN" generate reality-keypair
+}
+
+gen_short_id() {
+  openssl rand -hex 8
+}
+
+gen_password() {
+  openssl rand -base64 24 | tr -d '=+/\n' | cut -c1-24
+}
+
+# ─── arch detection ─────────────────────────────────────────────────────────
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    armv7l) echo armv7 ;;
+    *) die "unsupported arch: $(uname -m)" ;;
+  esac
+}
+
+# ─── upstream sing-box ──────────────────────────────────────────────────────
+latest_version() {
+  curl -fsSL "$REPO_API/releases/latest" \
+    | grep '"tag_name"' \
+    | head -n1 \
+    | sed -E 's/.*"v([^"]+)".*/\1/'
+}
+
+install_singbox_binary() {
+  require_cmd curl
+  require_cmd tar
+  local version arch tarball url tmp
+  version="${1:-$(latest_version)}"
+  [[ -n "$version" ]] || die "could not determine latest sing-box release"
+  arch="$(detect_arch)"
+  tarball="sing-box-${version}-linux-${arch}.tar.gz"
+  url="$REPO_DL/releases/download/v${version}/${tarball}"
+
+  step "Downloading sing-box ${version} (${arch})"
+  tmp="$(mktemp -d)"
+  curl -fsSL "$url" -o "$tmp/sb.tgz"
+  tar xzf "$tmp/sb.tgz" -C "$tmp"
+  install -m 0755 "$tmp/sing-box-${version}-linux-${arch}/sing-box" "$SINGBOX_BIN"
+  rm -rf "$tmp"
+  ok "installed $SINGBOX_BIN ($("$SINGBOX_BIN" version | head -n1))"
+}
+
+install_systemd_unit() {
+  step "Writing $UNIT_FILE"
+  emit_systemd_unit > "$UNIT_FILE"
+  systemctl daemon-reload
+  systemctl enable sing-box >/dev/null 2>&1 || true
+  ok "unit installed + enabled"
+}
+
+# ─── host prep (BBR + UFW) ──────────────────────────────────────────────────
+detect_os() {
+  [[ -r /etc/os-release ]] || die "/etc/os-release missing — unknown OS"
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  OS_PRETTY="${PRETTY_NAME:-${ID:-unknown} ${VERSION_ID:-}}"
+  IS_DEBIAN_LIKE=0
+  case "${ID:-}" in
+    ubuntu|debian) IS_DEBIAN_LIKE=1 ;;
+    *) [[ "${ID_LIKE:-}" =~ (debian|ubuntu) ]] && IS_DEBIAN_LIKE=1 ;;
+  esac
+}
+
+setup_bbr() {
+  header "TCP BBR"
+  local current avail
+  current="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+  avail="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo '')"
+  ok "current: $current"
+  ok "available: $avail"
+  if [[ "$current" == "bbr" ]]; then
+    ok "BBR already active — skipping"
+    return 0
+  fi
+  if ! grep -qw bbr <<< "$avail"; then
+    step "Loading tcp_bbr module"
+    if ! modprobe tcp_bbr 2>/dev/null; then
+      warn "kernel does not expose tcp_bbr — likely too old (need >= 4.9)"
+      return 1
+    fi
+  fi
+  step "Writing /etc/sysctl.d/99-bbr.conf"
+  cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
+# Managed by singbox — TCP BBR for sing-box egress
+net.core.default_qdisc = fq
+net.ipv4.tcp_congestion_control = bbr
+EOF
+  sysctl --system >/dev/null
+  current="$(sysctl -n net.ipv4.tcp_congestion_control)"
+  [[ "$current" == "bbr" ]] || die "expected bbr, got '$current'"
+  ok "BBR active"
+}
+
+setup_ufw() {
+  header "UFW firewall"
+  if [[ $IS_DEBIAN_LIKE -ne 1 ]]; then
+    warn "$OS_PRETTY — UFW auto-config skipped"
+    hint "open these ports manually with your firewall tooling:"
+    hint "    22/tcp  ssh"
+    hint "    443/tcp sing-box VLESS-REALITY"
+    hint "    443/udp sing-box Hysteria2"
+    return 0
+  fi
+  if ! command -v ufw >/dev/null; then
+    step "Installing ufw"
+    apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw >/dev/null
+  fi
+  ufw --force default deny incoming  >/dev/null
+  ufw --force default allow outgoing >/dev/null
+  ufw allow 22/tcp  comment 'ssh' >/dev/null
+  ufw allow 443/tcp comment 'sing-box vless-reality' >/dev/null
+  ufw allow 443/udp comment 'sing-box hysteria2' >/dev/null
+  ufw --force enable >/dev/null
+  ok "ufw active (22/tcp, 443/tcp, 443/udp open)"
+}
+
+# ─── render config ──────────────────────────────────────────────────────────
+render_config() {
+  require_cmd envsubst
+  mkdir -p "$CONFIG_DIR" "$DATA_DIR/cache" "$DATA_DIR/client"
+  chmod 0750 "$CONFIG_DIR"
+  step "Rendering $CONFIG_FILE"
+  ACME_DATA_DIR="$DATA_DIR/cache/acme" \
+    envsubst < <(emit_config_tpl) > "$CONFIG_FILE"
+  chmod 0640 "$CONFIG_FILE"
+  step "Validating config"
+  "$SINGBOX_BIN" check -c "$CONFIG_FILE" \
+    || die "config validation failed — inspect $CONFIG_FILE"
+  ok "config valid"
+}
+
+# ─── share link builders ────────────────────────────────────────────────────
+build_share_links() {
+  local label="${1:-SG}"
+  VLESS_LINK="vless://${VLESS_UUID}@${DOMAIN}:443?encryption=none&security=reality&sni=${REALITY_DEST_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${label}-REALITY"
+  HY2_LINK="hysteria2://${HYSTERIA2_PASSWORD}@${DOMAIN}:443/?sni=${DOMAIN}&obfs=salamander&obfs-password=${HYSTERIA2_OBFS_PASSWORD}#${label}-HY2"
+}
+
+# ─── subcommands ────────────────────────────────────────────────────────────
+cmd_install() {
+  require_root install
+  header "sing-box deployment installer"
+  detect_os
+  ok "$OS_PRETTY"
+
+  setup_bbr || warn "BBR setup did not complete — see message above"
+  setup_ufw
+
+  header "Installing sing-box binary"
+  install_singbox_binary
+
+  header "Installing systemd unit"
+  install_systemd_unit
+
+  header "Self-installing wrapper"
+  if [[ "$(readlink -f "$0")" != "$WRAPPER_BIN" ]]; then
+    install -m 0755 "$0" "$WRAPPER_BIN"
+    ok "installed $WRAPPER_BIN"
+  else
+    ok "wrapper already at $WRAPPER_BIN"
+  fi
+
+  if [[ -f "$ENV_FILE" ]] && env_has_required; then
+    header "Found pre-seeded $ENV_FILE — completing setup"
+    cmd_init  # fills missing secrets idempotently
+    cmd_up
+    return 0
+  fi
+
+  if [[ ! -f "$ENV_FILE" ]]; then
+    header "Writing $ENV_FILE template"
+    mkdir -p "$CONFIG_DIR"
+    chmod 0750 "$CONFIG_DIR"
+    emit_env_example > "$ENV_FILE"
+    chmod 0600 "$ENV_FILE"
+    ok "wrote $ENV_FILE"
+  fi
+
+  header "Next steps"
+  hint "1. edit $ENV_FILE — set DOMAIN, ACME_EMAIL, CF_API_TOKEN"
+  hint "2. sudo singbox init      # generate REALITY/Hy2 secrets"
+  hint "3. sudo singbox up        # render config + start service"
+}
+
+env_has_required() {
+  # Returns 0 if DOMAIN, ACME_EMAIL, CF_API_TOKEN are set in $ENV_FILE.
+  local v
+  for v in DOMAIN ACME_EMAIL CF_API_TOKEN; do
+    grep -q "^${v}=..*$" "$ENV_FILE" || return 1
+  done
+  return 0
+}
+
+cmd_setup() {
+  require_root setup
+  detect_os
+  header "sing-box host prep"
+  ok "$OS_PRETTY"
+  setup_bbr || warn "BBR setup did not complete"
+  setup_ufw
+}
+
+cmd_init() {
+  require_root init
+  [[ -x "$SINGBOX_BIN" ]] || die "sing-box binary missing — run 'singbox install' first"
+
+  if [[ ! -f "$ENV_FILE" ]]; then
+    mkdir -p "$CONFIG_DIR"
+    chmod 0750 "$CONFIG_DIR"
+    emit_env_example > "$ENV_FILE"
+    chmod 0600 "$ENV_FILE"
+  fi
+
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+
+  header "Generating secrets in $ENV_FILE"
+
+  if [[ -z "${VLESS_UUID:-}" ]]; then
+    step "VLESS UUID"
+    set_env VLESS_UUID "$(gen_uuid)"
+    ok "set"
+  fi
+  if [[ -z "${REALITY_PRIVATE_KEY:-}" || -z "${REALITY_PUBLIC_KEY:-}" ]]; then
+    step "REALITY keypair"
+    local kp
+    kp="$(gen_reality_keypair)"
+    set_env REALITY_PRIVATE_KEY "$(awk '/PrivateKey/ {print $2}' <<< "$kp")"
+    set_env REALITY_PUBLIC_KEY  "$(awk '/PublicKey/  {print $2}' <<< "$kp")"
+    ok "set"
+  fi
+  if [[ -z "${REALITY_SHORT_ID:-}" ]]; then
+    step "REALITY short ID"
+    set_env REALITY_SHORT_ID "$(gen_short_id)"
+    ok "set"
+  fi
+  if [[ -z "${HYSTERIA2_PASSWORD:-}" ]]; then
+    step "Hysteria2 password"
+    set_env HYSTERIA2_PASSWORD "$(gen_password)"
+    ok "set"
+  fi
+  if [[ -z "${HYSTERIA2_OBFS_PASSWORD:-}" ]]; then
+    step "Hysteria2 obfs password"
+    set_env HYSTERIA2_OBFS_PASSWORD "$(gen_password)"
+    ok "set"
+  fi
+
+  header "Next steps"
+  hint "1. confirm $ENV_FILE has DOMAIN, ACME_EMAIL, CF_API_TOKEN"
+  hint "2. sudo singbox up"
+}
+
+cmd_up() {
+  require_root up
+  [[ -x "$SINGBOX_BIN" ]] || die "sing-box binary missing — run 'singbox install' first"
+  load_env
+  require_vars "${SERVER_VARS[@]}"
+  render_config
+  step "Restarting sing-box"
+  systemctl daemon-reload
+  systemctl restart sing-box
+  sleep 1
+  if systemctl is-active --quiet sing-box; then
+    ok "sing-box active"
+  else
+    err "sing-box failed to start — recent logs follow"
+    journalctl -u sing-box -n 30 --no-pager
+    exit 1
+  fi
+  hint "follow logs:   sudo singbox logs"
+  hint "share links:   sudo singbox share"
+}
+
+cmd_down() {
+  require_root down
+  step "Stopping sing-box"
+  systemctl stop sing-box || true
+  ok "stopped"
+}
+
+cmd_logs() {
+  require_root logs
+  exec journalctl -fu sing-box
+}
+
+cmd_share() {
+  require_root share
+  load_env
+  require_vars "${CLIENT_VARS[@]}"
+  build_share_links "${1:-SG}"
+
+  mkdir -p "$DATA_DIR/client"
+  printf "%s\n%s\n" "$VLESS_LINK" "$HY2_LINK" > "$DATA_DIR/client/subscription.txt"
+  printf "%s\n%s\n" "$VLESS_LINK" "$HY2_LINK" \
+    | base64 -w0 > "$DATA_DIR/client/subscription.b64"
+  chmod 0640 "$DATA_DIR/client/subscription."*
+
+  header "Share links"
+  printf '%sVLESS-REALITY%s\n%s\n\n' "$C_BOLD" "$C_RESET" "$VLESS_LINK"
+  printf '%sHYSTERIA2%s\n%s\n'       "$C_BOLD" "$C_RESET" "$HY2_LINK"
+  echo
+  hint "wrote $DATA_DIR/client/subscription.{txt,b64}"
+
+  if command -v qrencode >/dev/null; then
+    header "QR codes"
+    printf '%sVLESS-REALITY%s\n' "$C_BOLD" "$C_RESET"
+    qrencode -t UTF8 <<< "$VLESS_LINK"
+    printf '\n%sHYSTERIA2%s\n' "$C_BOLD" "$C_RESET"
+    qrencode -t UTF8 <<< "$HY2_LINK"
+  else
+    hint "(install 'qrencode' for inline QR codes — apt install qrencode)"
+  fi
+
+  header "Subscribe URL (optional)"
+  hint "host $DATA_DIR/client/subscription.b64 at an unguessable URL — e.g."
+  hint "    gh gist create --secret $DATA_DIR/client/subscription.b64"
+  hint "then point Shadowrocket → Subscribe at the file's Raw URL."
+}
+
+cmd_upgrade() {
+  require_root upgrade
+  local current latest
+  current=""
+  if [[ -x "$SINGBOX_BIN" ]]; then
+    current="$("$SINGBOX_BIN" version | awk '/sing-box version/ {print $3}')"
+  fi
+  latest="$(latest_version)"
+  header "sing-box upgrade"
+  ok "current: ${current:-not installed}"
+  ok "latest:  $latest"
+  if [[ "$current" == "$latest" ]]; then
+    ok "already up to date"
+    return 0
+  fi
+  install_singbox_binary "$latest"
+  if systemctl is-active --quiet sing-box; then
+    step "Restarting sing-box"
+    systemctl restart sing-box
+    ok "restarted"
+  fi
+}
+
+cmd_status() {
+  require_root status
+  systemctl status sing-box --no-pager || true
+}
+
+# ─── dispatcher ─────────────────────────────────────────────────────────────
+row() {
+  printf '  %s%-18s%s %s\n' "${C_BOLD}" "$1" "${C_RESET}" "$2"
+}
+
+usage() {
+  header "sing-box deployment wrapper"
+  hint "low-exposure VLESS-REALITY (TCP/443) + Hysteria2+salamander (UDP/443)"
+  hint "single-binary upstream, systemd-managed, root-only."
+
+  header "Usage"
+  hint "sudo singbox <command> [args]"
+
+  header "Commands"
+  row "install"        "One-shot: BBR+UFW, sing-box binary, systemd unit, wrapper"
+  row "setup"          "Re-run host prep only (BBR + UFW)"
+  row "init"           "Fill missing secrets in $ENV_FILE"
+  row "up"             "Render config + (re)start service"
+  row "down"           "Stop service"
+  row "logs"           "journalctl -fu sing-box"
+  row "status"         "systemctl status sing-box"
+  row "share [label]"  "Print share links + QR codes; write subscription.{txt,b64}"
+  row "upgrade"        "Pull latest sing-box release + restart"
+
+  header "Paths"
+  hint "config: $CONFIG_DIR    (override \$SINGBOX_CONFIG_DIR)"
+  hint "data:   $DATA_DIR    (override \$SINGBOX_DATA_DIR)"
+
+  header "Examples"
+  hint "curl -fsSL https://raw.githubusercontent.com/imwithye/sing-box/main/install.sh | sudo bash"
+  hint "sudo vim $ENV_FILE && sudo singbox up"
+  hint "sudo singbox share MY-SG"
+  printf '\n'
+}
+
+main() {
+  case "${1:-}" in
+    install)            shift; cmd_install "$@" ;;
+    setup)              shift; cmd_setup   "$@" ;;
+    init)               shift; cmd_init    "$@" ;;
+    up)                 shift; cmd_up      "$@" ;;
+    down)               shift; cmd_down    "$@" ;;
+    logs)               shift; cmd_logs    "$@" ;;
+    status)             shift; cmd_status  "$@" ;;
+    share)              shift; cmd_share   "$@" ;;
+    upgrade)            shift; cmd_upgrade "$@" ;;
+    ""|-h|--help|help)  usage ;;
+    *)                  usage; exit 1 ;;
+  esac
+}
+
+main "$@"
