@@ -97,8 +97,7 @@ emit_config_tpl() {
       {
         "tag": "cloudflare-doh",
         "type": "https",
-        "server": "1.1.1.1",
-        "detour": "direct"
+        "server": "1.1.1.1"
       }
     ],
     "strategy": "prefer_ipv4"
