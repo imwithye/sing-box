@@ -23,7 +23,7 @@ plugin.
 /usr/local/bin/singbox          wrapper script (this repo)
 /usr/local/bin/sing-box         upstream binary (downloaded by `install`)
 /etc/systemd/system/sing-box.service
-/etc/sing-box/.env              secrets (mode 0600)
+/etc/sing-box/env               secrets (mode 0600)
 /etc/sing-box/config.json       rendered sing-box config (0640)
 /opt/sing-box/cache/            ACME certs + sing-box runtime state
 /opt/sing-box/client/           subscription.{txt,b64} (share output)
@@ -45,13 +45,13 @@ That's the whole bootstrap. It will:
 3. Download the latest sing-box release for your arch
    (`linux-amd64`/`arm64`) into `/usr/local/bin/sing-box`.
 4. Install the systemd unit + enable it.
-5. Drop a `/etc/sing-box/.env` template (or, if you pre-seeded it via
+5. Drop a `/etc/sing-box/env` template (or, if you pre-seeded it via
    cloud-init, generate the missing secrets and start the service).
 
 After installation:
 
 ```bash
-sudo vim /etc/sing-box/.env       # set DOMAIN, ACME_EMAIL, CF_API_TOKEN
+sudo vim /etc/sing-box/env        # set DOMAIN, ACME_EMAIL, CF_API_TOKEN
 sudo singbox init                 # generate REALITY/Hy2 secrets (idempotent)
 sudo singbox up                   # render config + (re)start service
 sudo singbox logs                 # follow journald output
@@ -65,7 +65,7 @@ cloud-init `user-data`:
 ```yaml
 #cloud-config
 write_files:
-  - path: /etc/sing-box/.env
+  - path: /etc/sing-box/env
     permissions: '0600'
     content: |
       DOMAIN=teleport.example.com
@@ -77,7 +77,7 @@ runcmd:
   - curl -fsSL https://raw.githubusercontent.com/imwithye/sing-box/main/install.sh | bash
 ```
 
-The installer notices the pre-seeded `.env`, fills in REALITY/Hy2
+The installer notices the pre-seeded env file, fills in REALITY/Hy2
 secrets, validates the config, and starts the service. Once cloud-init
 is done you can `sudo singbox share` over SSH to grab the subscription.
 
@@ -88,7 +88,7 @@ Six commands, all root-only:
 ```
 install   one-shot: BBR+UFW + sing-box binary + systemd unit + wrapper
 setup     re-run host prep only (BBR + UFW)
-init      fill missing secrets in /etc/sing-box/.env
+init      fill missing secrets in /etc/sing-box/env
 up        render config + (re)start service
 down      stop service
 logs      journalctl -fu sing-box
@@ -100,9 +100,9 @@ upgrade   pull latest sing-box release + restart
 Updating sing-box: `sudo singbox upgrade`. Updating the wrapper itself:
 `curl -fsSL .../install.sh | sudo bash` again — `install` is idempotent.
 
-If you change `VLESS_UUID`, `REALITY_*`, or `HYSTERIA2_*` in `.env`,
-every existing client must be re-imported. Treat `/etc/sing-box/.env`
-like a private key — it is the entire trust root.
+If you change `VLESS_UUID`, `REALITY_*`, or `HYSTERIA2_*` in
+`/etc/sing-box/env`, every existing client must be re-imported. Treat
+that file like a private key — it is the entire trust root.
 
 ## Hand off to Shadowrocket
 

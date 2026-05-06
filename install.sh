@@ -4,12 +4,12 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/imwithye/sing-box/main/install.sh | sudo bash
 #
-# In cloud-init you can pre-seed /etc/sing-box/.env (DOMAIN, ACME_EMAIL,
+# In cloud-init you can pre-seed /etc/sing-box/env (DOMAIN, ACME_EMAIL,
 # CF_API_TOKEN at minimum) and the installer will run end-to-end:
 # BBR + UFW + sing-box binary + systemd unit + secrets + service start.
 #
-# Without a pre-seeded .env it stops after installing the binary and
-# leaves a /etc/sing-box/.env template for you to fill in.
+# Without a pre-seeded env file it stops after installing the binary and
+# leaves a /etc/sing-box/env template for you to fill in.
 
 set -euo pipefail
 

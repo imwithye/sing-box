@@ -14,7 +14,7 @@ REPO_DL="${SINGBOX_REPO_DL:-https://github.com/SagerNet/sing-box}"
 CONFIG_DIR="${SINGBOX_CONFIG_DIR:-/etc/sing-box}"
 DATA_DIR="${SINGBOX_DATA_DIR:-/opt/sing-box}"
 
-ENV_FILE="$CONFIG_DIR/.env"
+ENV_FILE="$CONFIG_DIR/env"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 UNIT_FILE="/etc/systemd/system/sing-box.service"
 SINGBOX_BIN="/usr/local/bin/sing-box"
