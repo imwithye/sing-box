@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# singbox — one-binary VLESS+REALITY + Hysteria2 deployment wrapper.
+# sing-box-ctl — one-binary VLESS+REALITY + Hysteria2 deployment wrapper.
 #
 # Talks straight to the upstream sing-box release binary + a systemd unit.
 # No Docker, no compose plugin, no Go runtime: just bash + curl + systemd.
@@ -18,7 +18,7 @@ ENV_FILE="$CONFIG_DIR/env"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 UNIT_FILE="/etc/systemd/system/sing-box.service"
 SINGBOX_BIN="/usr/local/bin/sing-box"
-WRAPPER_BIN="/usr/local/bin/singbox"
+WRAPPER_BIN="/usr/local/bin/sing-box-ctl"
 
 # ─── pretty output ──────────────────────────────────────────────────────────
 if [[ -t 1 && "${NO_COLOR:-}" == "" ]]; then
@@ -39,7 +39,7 @@ die()    { err "$*"; exit 1; }
 
 # ─── prerequisites ──────────────────────────────────────────────────────────
 require_root() {
-  [[ $EUID -eq 0 ]] || die "must run as root — try: sudo singbox ${1:-}"
+  [[ $EUID -eq 0 ]] || die "must run as root — try: sudo sing-box-ctl ${1:-}"
 }
 
 require_cmd() {
@@ -74,7 +74,7 @@ CF_API_TOKEN=
 REALITY_DEST_SNI=www.apple.com
 REALITY_DEST_PORT=443
 
-# ---- Generated secrets (filled in by `singbox init`) --------------------
+# ---- Generated secrets (filled in by `sing-box-ctl setup`) -------------
 # Do not edit by hand unless you intend to invalidate every existing client.
 VLESS_UUID=
 REALITY_PRIVATE_KEY=
@@ -210,7 +210,7 @@ EOF
 
 # ─── env file helpers ───────────────────────────────────────────────────────
 load_env() {
-  [[ -f "$ENV_FILE" ]] || die "$ENV_FILE not found — run 'singbox init' first"
+  [[ -f "$ENV_FILE" ]] || die "$ENV_FILE not found — run 'sing-box-ctl setup' first"
   set -a; # shellcheck disable=SC1090
   source "$ENV_FILE"
   set +a
@@ -264,7 +264,7 @@ gen_uuid() {
 }
 
 gen_reality_keypair() {
-  [[ -x "$SINGBOX_BIN" ]] || die "sing-box binary missing — run 'singbox install' first"
+  [[ -x "$SINGBOX_BIN" ]] || die "sing-box binary missing — run 'sing-box-ctl setup' first"
   "$SINGBOX_BIN" generate reality-keypair
 }
 
@@ -354,7 +354,7 @@ setup_bbr() {
   fi
   step "Writing /etc/sysctl.d/99-bbr.conf"
   cat > /etc/sysctl.d/99-bbr.conf <<'EOF'
-# Managed by singbox — TCP BBR for sing-box egress
+# Managed by sing-box-ctl — TCP BBR for sing-box egress
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 EOF
@@ -418,6 +418,63 @@ env_has_required() {
     grep -q "^${v}=..*$" "$ENV_FILE" || return 1
   done
   return 0
+}
+
+# For DOMAIN / ACME_EMAIL / CF_API_TOKEN / REALITY_DEST_SNI: if empty in
+# $ENV_FILE, prefer the matching SINGBOX_<VAR> env var (set by install.sh
+# from --domain/--email/--token/--sni flags), otherwise prompt on /dev/tty.
+configure_user_vars() {
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+
+  configure_var DOMAIN          required \
+    "Domain pointing at this VPS (DNS-only on Cloudflare):"
+  configure_var ACME_EMAIL      required \
+    "Contact email for Let's Encrypt registration:"
+  configure_var CF_API_TOKEN    required \
+    "Cloudflare API token (Zone.DNS:Edit + Zone.Zone:Read):"
+  configure_var REALITY_DEST_SNI optional \
+    "REALITY camouflage destination [www.apple.com]:"
+}
+
+# configure_var VARNAME required|optional PROMPT_TEXT
+configure_var() {
+  local var="$1" mode="$2" prompt="$3"
+
+  # Explicit SINGBOX_<VAR> override (e.g. install.sh --sni=...) always wins.
+  local fb_var="SINGBOX_${var}"
+  local fb="${!fb_var:-}"
+  if [[ -n "$fb" ]]; then
+    set_env "$var" "$fb"
+    # shellcheck disable=SC2034
+    eval "$var=\"\$fb\""
+    ok "$var ← (from \$$fb_var)"
+    return 0
+  fi
+
+  # Otherwise keep an existing non-empty env-file value untouched.
+  local current="${!var:-}"
+  [[ -n "$current" ]] && return 0
+
+  if [[ -e /dev/tty && -r /dev/tty ]]; then
+    local value
+    while true; do
+      printf '  %s%s%s ' "${C_CYAN}" "$prompt" "${C_RESET}"
+      read -r value </dev/tty || value=""
+      if [[ -n "$value" ]]; then
+        set_env "$var" "$value"
+        eval "$var=\"\$value\""
+        ok "$var set"
+        return 0
+      fi
+      [[ "$mode" == "optional" ]] && return 0
+      err "$var cannot be empty"
+    done
+  fi
+
+  if [[ "$mode" == "required" ]]; then
+    die "$var is empty and no TTY for prompt — set $fb_var or rerun on a TTY"
+  fi
 }
 
 # Idempotent: fills empty REALITY / VLESS / Hy2 secrets in $ENV_FILE.
@@ -485,6 +542,7 @@ cmd_setup() {
   else
     ok "$ENV_FILE already exists"
   fi
+  configure_user_vars
   fill_secrets
 
   if env_has_required; then
@@ -493,13 +551,13 @@ cmd_setup() {
   else
     header "Next steps"
     hint "1. edit $ENV_FILE — set DOMAIN, ACME_EMAIL, CF_API_TOKEN"
-    hint "2. sudo singbox up"
+    hint "2. sudo sing-box-ctl up"
   fi
 }
 
 cmd_up() {
   require_root up
-  [[ -x "$SINGBOX_BIN" ]] || die "sing-box binary missing — run 'singbox setup' first"
+  [[ -x "$SINGBOX_BIN" ]] || die "sing-box binary missing — run 'sing-box-ctl setup' first"
   load_env
   require_vars "${SERVER_VARS[@]}"
   render_config
@@ -514,8 +572,8 @@ cmd_up() {
     journalctl -u sing-box -n 30 --no-pager
     exit 1
   fi
-  hint "follow logs:   sudo singbox logs"
-  hint "share links:   sudo singbox share"
+  hint "follow logs:   sudo sing-box-ctl logs"
+  hint "share links:   sudo sing-box-ctl share"
 }
 
 cmd_down() {
@@ -603,7 +661,7 @@ usage() {
   hint "single-binary upstream, systemd-managed, root-only."
 
   header "Usage"
-  hint "sudo singbox <command> [args]"
+  hint "sudo sing-box-ctl <command> [args]"
 
   header "Commands"
   row "setup"          "Install everything: BBR+UFW, sing-box binary, unit, wrapper, secrets"
@@ -620,8 +678,8 @@ usage() {
 
   header "Examples"
   hint "curl -fsSL https://raw.githubusercontent.com/imwithye/sing-box/main/install.sh | sudo bash"
-  hint "sudo vim $ENV_FILE && sudo singbox up"
-  hint "sudo singbox share MY-SG"
+  hint "sudo vim $ENV_FILE && sudo sing-box-ctl up"
+  hint "sudo sing-box-ctl share MY-SG"
   printf '\n'
 }
 
