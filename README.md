@@ -47,7 +47,7 @@ cloud)** — sing-box protocols don't pass through Cloudflare's CDN.
 
 ## Commands
 
-Seven commands, all root-only:
+Eight commands, all root-only:
 
 ```
 setup     install everything (idempotent — also re-pulls the wrapper +
@@ -58,6 +58,7 @@ logs      journalctl -fu sing-box
 status    systemctl status sing-box
 share     print share links + QR codes; write subscription.{txt,b64}
 upgrade   pull the latest sing-box release + restart
+purge     tear down the deployment (service + binaries + config + 443 ufw rules)
 ```
 
 ## On-disk layout
@@ -80,10 +81,9 @@ upgrade   pull the latest sing-box release + restart
 sudo sing-box-ctl share              # prints links + QR + writes subscription.{txt,b64}
 ```
 
-- **One-off import**: scan the QR codes (needs `qrencode` —
-  `apt install qrencode`) or paste the printed links into your client
-  (Shadowrocket, sing-box, etc.). Group them as `url-test` for automatic
-  failover.
+- **One-off import**: scan the QR codes or paste the printed links into
+  your client (Shadowrocket, sing-box, etc.). Group them as `url-test`
+  for automatic failover.
 - **Subscribe URL**: host `/etc/sing-box/client/subscription.b64` at an
   unguessable URL (e.g.
   `gh gist create --secret /etc/sing-box/client/subscription.b64`) and
