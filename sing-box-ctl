@@ -696,6 +696,80 @@ cmd_status() {
   systemctl status sing-box --no-pager || true
 }
 
+cmd_purge() {
+  require_root purge
+
+  header "About to purge sing-box deployment"
+  warn "destructive — secrets, certs and client subscriptions will be wiped"
+  hint "removes:"
+  hint "    $SINGBOX_BIN"
+  hint "    $WRAPPER_BIN"
+  hint "    $UNIT_FILE"
+  hint "    $CONFIG_DIR/  (env + config + acme cache + client/)"
+  hint "    ufw allow 443/tcp + 443/udp  (22/tcp preserved)"
+  hint "leaves untouched (clean up manually if you want):"
+  hint "    cloudflare A/AAAA record + API token"
+  hint "    let's encrypt account (certs auto-expire in 90d)"
+  hint "    /etc/sysctl.d/99-bbr.conf, tcp_bbr module"
+  hint "    qrencode + ufw apt packages"
+
+  [[ -e /dev/tty && -r /dev/tty ]] || die "purge needs a TTY for confirmation"
+  printf '\n'
+  ask "type 'yes' to proceed:"
+  local confirm=""
+  read -r confirm </dev/tty || true
+  [[ "$confirm" == "yes" ]] || die "aborted"
+
+  header "Stopping service"
+  if systemctl is-active --quiet sing-box; then
+    step "stopping sing-box"
+    systemctl stop sing-box
+  fi
+  if systemctl is-enabled --quiet sing-box 2>/dev/null; then
+    step "disabling sing-box"
+    systemctl disable sing-box >/dev/null 2>&1 || true
+  fi
+  if [[ -f "$UNIT_FILE" ]]; then
+    step "removing $UNIT_FILE"
+    rm -f "$UNIT_FILE"
+    systemctl daemon-reload
+  fi
+  ok "service removed"
+
+  header "Removing files"
+  local path
+  for path in "$SINGBOX_BIN" "$WRAPPER_BIN"; do
+    if [[ -e "$path" ]]; then
+      step "removing $path"
+      rm -f "$path"
+    fi
+  done
+  if [[ -d "$CONFIG_DIR" ]]; then
+    step "removing $CONFIG_DIR"
+    rm -rf "$CONFIG_DIR"
+  fi
+  ok "files removed"
+
+  header "Closing firewall ports"
+  if command -v ufw >/dev/null && ufw status >/dev/null 2>&1; then
+    local rule
+    for rule in 443/tcp 443/udp; do
+      if ufw status | awk '{print $1}' | grep -qx "$rule"; then
+        step "ufw delete allow $rule"
+        ufw delete allow "$rule" >/dev/null 2>&1 || true
+      fi
+    done
+    ok "443 closed (22/tcp preserved)"
+  else
+    hint "ufw not active — skipping"
+  fi
+
+  header "Done"
+  hint "manual follow-ups:"
+  hint "    cloudflare DNS:  delete A/AAAA for your domain"
+  hint "    cloudflare API:  revoke token at dash.cloudflare.com/profile/api-tokens"
+}
+
 # ─── dispatcher ─────────────────────────────────────────────────────────────
 row() {
   printf '  %s%-18s%s %s\n' "${C_BOLD}" "$1" "${C_RESET}" "$2"
@@ -717,6 +791,7 @@ usage() {
   row "status"         "systemctl status sing-box"
   row "share [label]"  "Print share links + QR codes; write subscription.{txt,b64}"
   row "upgrade"        "Pull latest sing-box release + restart"
+  row "purge"          "Remove service, binaries, config, secrets, 443 ufw rules"
 
   header "Paths"
   hint "root: $CONFIG_DIR    (override \$SINGBOX_CONFIG_DIR)"
@@ -737,6 +812,7 @@ main() {
     status)             shift; cmd_status  "$@" ;;
     share)              shift; cmd_share   "$@" ;;
     upgrade)            shift; cmd_upgrade "$@" ;;
+    purge)              shift; cmd_purge   "$@" ;;
     ""|-h|--help|help)  usage ;;
     *)                  usage; exit 1 ;;
   esac
