@@ -718,7 +718,7 @@ cmd_purge() {
   hint "    ufw allow 443/tcp + 443/udp  (22/tcp preserved)"
   hint "leaves untouched (clean up manually if you want):"
   hint "    cloudflare A/AAAA record + API token"
-  hint "    let's encrypt account (certs auto-expire in 90d)"
+  hint "    let's encrypt account on LE side (local key under cache/ is wiped; certs auto-expire in 90d)"
   hint "    /etc/sysctl.d/99-bbr.conf, tcp_bbr module"
   hint "    qrencode + ufw apt packages"
 
@@ -793,7 +793,7 @@ usage() {
   hint "sudo sing-box-ctl <command> [args]"
 
   header "Commands"
-  row "setup"          "Install everything: BBR+UFW, sing-box binary, unit, wrapper, secrets"
+  row "setup"          "Install everything: BBR, apt deps (ufw + qrencode), UFW rules, sing-box binary, unit, wrapper, secrets"
   row "up"             "Render config + (re)start service"
   row "down"           "Stop service"
   row "logs"           "journalctl -fu sing-box"
