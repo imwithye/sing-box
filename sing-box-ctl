@@ -377,6 +377,30 @@ EOF
 
 ufw_allow() { ufw allow "$1" comment "$2" >/dev/null; }
 
+# ufw drives the firewall; qrencode lets `share` render inline QR codes.
+SYSTEM_PKGS=(ufw qrencode)
+
+setup_packages() {
+  header "System packages"
+  if [[ $IS_DEBIAN_LIKE -ne 1 ]]; then
+    warn "$OS_PRETTY — apt auto-install skipped"
+    hint "install manually: ${SYSTEM_PKGS[*]}"
+    return 0
+  fi
+  local pkg missing=()
+  for pkg in "${SYSTEM_PKGS[@]}"; do
+    command -v "$pkg" >/dev/null || missing+=("$pkg")
+  done
+  if (( ${#missing[@]} == 0 )); then
+    ok "${SYSTEM_PKGS[*]} already installed"
+    return 0
+  fi
+  step "Installing ${missing[*]}"
+  apt-get update -qq
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" >/dev/null
+  ok "installed: ${missing[*]}"
+}
+
 setup_ufw() {
   header "UFW firewall"
   if [[ $IS_DEBIAN_LIKE -ne 1 ]]; then
@@ -386,11 +410,6 @@ setup_ufw() {
     hint "    443/tcp sing-box VLESS-REALITY"
     hint "    443/udp sing-box Hysteria2"
     return 0
-  fi
-  if ! command -v ufw >/dev/null; then
-    step "Installing ufw"
-    apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ufw >/dev/null
   fi
   ufw --force default deny incoming  >/dev/null
   ufw --force default allow outgoing >/dev/null
@@ -522,6 +541,7 @@ cmd_setup() {
   ok "$OS_PRETTY"
 
   setup_bbr || warn "BBR setup did not complete — see message above"
+  setup_packages
   setup_ufw
 
   header "Installing sing-box binary"
