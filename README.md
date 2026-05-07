@@ -50,15 +50,15 @@ cloud)** — sing-box protocols don't pass through Cloudflare's CDN.
 Eight commands, all root-only:
 
 ```
-setup     install everything (idempotent — also re-pulls the wrapper +
-          regenerates only-empty secrets; auto-runs `up` if env is complete)
-up        render config + (re)start service
-down      stop service
-logs      journalctl -fu sing-box
-status    systemctl status sing-box
-share     print share links + QR codes; write subscription.{txt,b64}
-upgrade   pull the latest sing-box release + restart
-purge     tear down the deployment (service + binaries + config + 443 ufw rules)
+setup          install everything (idempotent — also re-pulls the wrapper +
+               regenerates only-empty secrets; auto-runs `up` if env is complete)
+up             render config + (re)start service
+down           stop service
+logs           journalctl -fu sing-box
+status         systemctl status sing-box
+share [label]  print share links + QR codes; write subscription.{txt,b64}
+upgrade        pull the latest sing-box release + restart
+purge          tear down the deployment (service + binaries + config + 443 ufw rules)
 ```
 
 ## On-disk layout

@@ -220,8 +220,12 @@ load_env() {
 
 set_env() {
   local key="$1" val="$2"
+  [[ "$val" != *$'\n'* ]] || die "set_env: value for $key contains newline"
   if grep -q "^${key}=" "$ENV_FILE" 2>/dev/null; then
-    sed -i "s|^${key}=.*|${key}=${val}|" "$ENV_FILE"
+    # Escape sed-replacement metacharacters in $val (\, &, the | delimiter).
+    local esc
+    esc=$(printf '%s' "$val" | sed -e 's/[\\&|]/\\&/g')
+    sed -i "s|^${key}=.*|${key}=${esc}|" "$ENV_FILE"
   else
     printf '%s=%s\n' "$key" "$val" >> "$ENV_FILE"
   fi
@@ -429,7 +433,7 @@ render_config() {
   step "Rendering $CONFIG_FILE"
   ACME_DATA_DIR="$CACHE_DIR/acme" \
     envsubst < <(emit_config_tpl) > "$CONFIG_FILE"
-  chmod 0640 "$CONFIG_FILE"
+  chmod 0600 "$CONFIG_FILE"
   step "Validating config"
   "$SINGBOX_BIN" check -c "$CONFIG_FILE" \
     || die "config validation failed — inspect $CONFIG_FILE"
@@ -451,7 +455,7 @@ qr_common_version() {
     base=""
     local same=1
     for link in "$@"; do
-      rows=$(qrencode -t UTF8 -v "$v" <<< "$link" 2>/dev/null | wc -l)
+      rows=$( { qrencode -t UTF8 -v "$v" <<< "$link" 2>/dev/null || true; } | wc -l )
       [[ -z $base ]] && base="$rows"
       [[ "$rows" != "$base" ]] && { same=0; break; }
     done
@@ -701,6 +705,8 @@ cmd_status() {
 
 cmd_purge() {
   require_root purge
+  [[ "$CONFIG_DIR" =~ /sing-box(/|$) ]] \
+    || die "refusing to purge — \$CONFIG_DIR='$CONFIG_DIR' doesn't look like a sing-box config dir"
 
   header "About to purge sing-box deployment"
   warn "destructive — secrets, certs and client subscriptions will be wiped"
@@ -725,15 +731,15 @@ cmd_purge() {
 
   header "Stopping service"
   if systemctl is-active --quiet sing-box; then
-    step "stopping sing-box"
+    step "Stopping sing-box"
     systemctl stop sing-box || warn "stop failed — continuing purge anyway"
   fi
   if systemctl is-enabled --quiet sing-box 2>/dev/null; then
-    step "disabling sing-box"
+    step "Disabling sing-box"
     systemctl disable sing-box >/dev/null 2>&1 || true
   fi
   if [[ -f "$UNIT_FILE" ]]; then
-    step "removing $UNIT_FILE"
+    step "Removing $UNIT_FILE"
     rm -f "$UNIT_FILE"
     systemctl daemon-reload
   fi
@@ -743,12 +749,12 @@ cmd_purge() {
   local path
   for path in "$SINGBOX_BIN" "$WRAPPER_BIN"; do
     if [[ -e "$path" ]]; then
-      step "removing $path"
+      step "Removing $path"
       rm -f "$path"
     fi
   done
   if [[ -d "$CONFIG_DIR" ]]; then
-    step "removing $CONFIG_DIR"
+    step "Removing $CONFIG_DIR"
     rm -rf "$CONFIG_DIR"
   fi
   ok "files removed"
@@ -758,7 +764,7 @@ cmd_purge() {
     local rule
     for rule in 443/tcp 443/udp; do
       if ufw status | awk '{print $1}' | grep -qx "$rule"; then
-        step "ufw delete allow $rule"
+        step "Removing ufw allow $rule"
         ufw delete allow "$rule" >/dev/null 2>&1 || true
       fi
     done
