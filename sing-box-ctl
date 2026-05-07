@@ -416,10 +416,16 @@ render_config() {
 }
 
 # ─── share link builders ────────────────────────────────────────────────────
+# label is optional — when empty the fragment is just REALITY / HY2.
 build_share_links() {
-  local label="${1:-SG}"
-  VLESS_LINK="vless://${VLESS_UUID}@${DOMAIN}:443?encryption=none&security=reality&sni=${REALITY_DEST_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${label}-REALITY"
-  HY2_LINK="hysteria2://${HYSTERIA2_PASSWORD}@${DOMAIN}:443/?sni=${DOMAIN}&obfs=salamander&obfs-password=${HYSTERIA2_OBFS_PASSWORD}#${label}-HY2"
+  local label="${1:-}"
+  local vless_tag="REALITY" hy2_tag="HY2"
+  if [[ -n "$label" ]]; then
+    vless_tag="${label}-REALITY"
+    hy2_tag="${label}-HY2"
+  fi
+  VLESS_LINK="vless://${VLESS_UUID}@${DOMAIN}:443?encryption=none&security=reality&sni=${REALITY_DEST_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${vless_tag}"
+  HY2_LINK="hysteria2://${HYSTERIA2_PASSWORD}@${DOMAIN}:443/?sni=${DOMAIN}&obfs=salamander&obfs-password=${HYSTERIA2_OBFS_PASSWORD}#${hy2_tag}"
 }
 
 # ─── subcommands ────────────────────────────────────────────────────────────
@@ -601,7 +607,7 @@ cmd_share() {
   require_root share
   load_env
   require_vars "${CLIENT_VARS[@]}"
-  build_share_links "${1:-SG}"
+  build_share_links "${1:-}"
 
   mkdir -p "$CLIENT_DIR"
   printf "%s\n%s\n" "$VLESS_LINK" "$HY2_LINK" > "$CLIENT_DIR/subscription.txt"
