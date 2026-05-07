@@ -35,6 +35,7 @@ ok()     { printf '  %s✓%s %s\n' "${C_GREEN}"  "${C_RESET}" "$*"; }
 warn()   { printf '  %s!%s %s\n' "${C_YELLOW}" "${C_RESET}" "$*"; }
 err()    { printf '  %s✗%s %s\n' "${C_RED}"    "${C_RESET}" "$*" >&2; }
 hint()   { printf '  %s%s%s\n'   "${C_DIM}"    "$*"        "${C_RESET}"; }
+ask()    { printf '  %s?%s %s '  "${C_BLUE}"   "${C_RESET}" "$*"; }
 die()    { err "$*"; exit 1; }
 
 # ─── prerequisites ──────────────────────────────────────────────────────────
@@ -416,16 +417,10 @@ render_config() {
 }
 
 # ─── share link builders ────────────────────────────────────────────────────
-# label is optional — when empty the fragment is just REALITY / HY2.
 build_share_links() {
-  local label="${1:-}"
-  local vless_tag="REALITY" hy2_tag="HY2"
-  if [[ -n "$label" ]]; then
-    vless_tag="${label}-REALITY"
-    hy2_tag="${label}-HY2"
-  fi
-  VLESS_LINK="vless://${VLESS_UUID}@${DOMAIN}:443?encryption=none&security=reality&sni=${REALITY_DEST_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${vless_tag}"
-  HY2_LINK="hysteria2://${HYSTERIA2_PASSWORD}@${DOMAIN}:443/?sni=${DOMAIN}&obfs=salamander&obfs-password=${HYSTERIA2_OBFS_PASSWORD}#${hy2_tag}"
+  local prefix="${1:+${1}-}"
+  VLESS_LINK="vless://${VLESS_UUID}@${DOMAIN}:443?encryption=none&security=reality&sni=${REALITY_DEST_SNI}&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SHORT_ID}&type=tcp&flow=xtls-rprx-vision#${prefix}REALITY"
+  HY2_LINK="hysteria2://${HYSTERIA2_PASSWORD}@${DOMAIN}:443/?sni=${DOMAIN}&obfs=salamander&obfs-password=${HYSTERIA2_OBFS_PASSWORD}#${prefix}HY2"
 }
 
 # ─── subcommands ────────────────────────────────────────────────────────────
@@ -474,7 +469,7 @@ configure_var() {
   if [[ -e /dev/tty && -r /dev/tty ]]; then
     local value
     while true; do
-      printf '  %s?%s %s ' "${C_BLUE}" "${C_RESET}" "$prompt"
+      ask "$prompt"
       read -r value </dev/tty || value=""
       if [[ -n "$value" ]]; then
         set_env "$var" "$value"
