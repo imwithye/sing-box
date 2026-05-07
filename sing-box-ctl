@@ -553,7 +553,12 @@ fill_secrets() {
     changed=1
   fi
 
-  (( changed == 0 )) && ok "all secrets already populated"
+  # Don't use `(( … )) && ok …` here — when changed=1 (i.e. we DID
+  # generate secrets), the (( )) returns exit 1, which under set -e
+  # aborts the caller (cmd_setup) before it gets to the auto-up step.
+  if (( changed == 0 )); then
+    ok "all secrets already populated"
+  fi
 }
 
 cmd_setup() {
