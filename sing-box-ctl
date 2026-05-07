@@ -442,6 +442,23 @@ build_share_links() {
   HY2_LINK="hysteria2://${HYSTERIA2_PASSWORD}@${DOMAIN}:443/?sni=${DOMAIN}&obfs=salamander&obfs-password=${HYSTERIA2_OBFS_PASSWORD}#${prefix}HY2"
 }
 
+# qrencode -v is a *minimum* (data auto-grows past it), so walk v up
+# until every input renders at the same row count → same visual size.
+qr_common_version() {
+  local v link rows base
+  for v in {1..40}; do
+    base=""
+    local same=1
+    for link in "$@"; do
+      rows=$(qrencode -t UTF8 -v "$v" <<< "$link" 2>/dev/null | wc -l)
+      [[ -z $base ]] && base="$rows"
+      [[ "$rows" != "$base" ]] && { same=0; break; }
+    done
+    (( same == 1 )) && { printf '%s' "$v"; return; }
+  done
+  printf '40'
+}
+
 # ─── subcommands ────────────────────────────────────────────────────────────
 # Returns 0 if DOMAIN, ACME_EMAIL, CF_API_TOKEN are set + non-empty in $ENV_FILE.
 env_has_required() {
@@ -638,10 +655,12 @@ cmd_share() {
 
   if command -v qrencode >/dev/null; then
     header "QR codes"
+    local qrv
+    qrv="$(qr_common_version "$VLESS_LINK" "$HY2_LINK")"
     printf '%sVLESS-REALITY%s\n' "$C_BOLD" "$C_RESET"
-    qrencode -t UTF8 <<< "$VLESS_LINK"
+    qrencode -t UTF8 -v "$qrv" <<< "$VLESS_LINK"
     printf '\n%sHYSTERIA2%s\n' "$C_BOLD" "$C_RESET"
-    qrencode -t UTF8 <<< "$HY2_LINK"
+    qrencode -t UTF8 -v "$qrv" <<< "$HY2_LINK"
   else
     hint "(install 'qrencode' for inline QR codes — apt install qrencode)"
   fi
