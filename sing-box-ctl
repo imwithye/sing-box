@@ -542,29 +542,45 @@ configure_user_vars() {
   source "$ENV_FILE"
 
   configure_var DOMAIN          required \
-    "Domain pointing at this VPS (DNS-only on Cloudflare):"
+    "Domain pointing at this VPS (DNS-only on Cloudflare)"
   configure_var ACME_EMAIL      required \
-    "Contact email for Let's Encrypt registration:"
+    "Contact email for Let's Encrypt registration"
   configure_var CF_API_TOKEN    required \
-    "Cloudflare API token (Zone.DNS:Edit + Zone.Zone:Read):"
+    "Cloudflare API token (Zone.DNS:Edit + Zone.Zone:Read)"
   configure_var REALITY_DEST_SNI optional \
-    "REALITY camouflage destination [www.apple.com]:"
+    "REALITY camouflage destination"
   configure_var TS_AUTH_KEY      optional \
-    "Tailscale auth key — enables tailnet egress (blank to skip):"
+    "Tailscale auth key — enables tailnet egress (blank to skip)"
   # Hostname only matters if a key was provided; default derives from DOMAIN.
   # shellcheck disable=SC1090
   source "$ENV_FILE"
   if [[ -n "${TS_AUTH_KEY:-}" ]]; then
     configure_var TS_HOSTNAME    optional \
-      "Tailnet hostname for this node [${DOMAIN%%.*}]:"
+      "Tailnet hostname (defaults to ${DOMAIN%%.*} if blank)"
+  fi
+}
+
+# Truncate long values to first8…last8 so secrets don't overflow the prompt
+# while still letting the user verify the right value is loaded.
+display_value() {
+  local v="$1"
+  if (( ${#v} > 30 )); then
+    printf '%s…%s' "${v:0:8}" "${v: -8}"
+  else
+    printf '%s' "$v"
   fi
 }
 
 # configure_var VARNAME required|optional PROMPT_TEXT
+#
+# Resolution order:
+#   1. SINGBOX_<VAR> override (set by install.sh flags) always wins.
+#   2. TTY: prompt with current value as `[placeholder]` — Enter keeps the
+#      existing value, anything else replaces it. Required + empty re-asks.
+#   3. No TTY: keep existing value, or die if required and empty.
 configure_var() {
   local var="$1" mode="$2" prompt="$3"
 
-  # Explicit SINGBOX_<VAR> override (e.g. install.sh --sni=...) always wins.
   local fb_var="SINGBOX_${var}"
   local fb="${!fb_var:-}"
   if [[ -n "$fb" ]]; then
@@ -573,52 +589,93 @@ configure_var() {
     return 0
   fi
 
-  # Otherwise keep an existing non-empty env-file value untouched.
-  [[ -n "${!var:-}" ]] && return 0
+  local current="${!var:-}"
 
   if [[ -e /dev/tty && -r /dev/tty ]]; then
-    local value
+    local value display
+    display="$(display_value "$current")"
     while true; do
-      ask "$prompt"
-      read -r value </dev/tty || value=""
-      if [[ -n "$value" ]]; then
-        set_env "$var" "$value"
-        ok "$var set"
-        return 0
+      if [[ -n "$current" ]]; then
+        ask "$prompt [$display]:"
+      else
+        ask "$prompt:"
       fi
-      [[ "$mode" == "optional" ]] && return 0
-      err "$var cannot be empty"
+      read -r value </dev/tty || value=""
+      if [[ -z "$value" ]]; then
+        if [[ -n "$current" ]]; then
+          ok "$var unchanged"
+          return 0
+        fi
+        [[ "$mode" == "optional" ]] && return 0
+        err "$var cannot be empty"
+        continue
+      fi
+      set_env "$var" "$value"
+      ok "$var updated"
+      return 0
     done
   fi
 
-  if [[ "$mode" == "required" ]]; then
+  if [[ "$mode" == "required" && -z "$current" ]]; then
     die "$var is empty and no TTY for prompt — set $fb_var or rerun on a TTY"
   fi
+  return 0
 }
 
-# Idempotent: fills empty REALITY / VLESS / Hy2 secrets in $ENV_FILE.
+# Returns 0 if the user interactively confirms regenerating $1.
+# Returns 1 (no regen) when there's no TTY or the answer isn't y/Y.
+confirm_regen() {
+  local name="$1" reply=""
+  [[ -e /dev/tty && -r /dev/tty ]] || return 1
+  ask "regenerate $name? [y/N]:"
+  read -r reply </dev/tty || reply=""
+  [[ "$reply" =~ ^[Yy] ]]
+}
+
+# Empty secrets are auto-generated. Existing ones prompt y/N to regenerate
+# (default keep). Regen invalidates clients still using the old value.
 fill_secrets() {
   # shellcheck disable=SC1090
   source "$ENV_FILE"
-  local changed=0 spec name gen
+  local changed=0 spec name gen v has_existing=0
+
+  for v in VLESS_UUID REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY \
+           REALITY_SHORT_ID HYSTERIA2_PASSWORD HYSTERIA2_OBFS_PASSWORD; do
+    [[ -n "${!v:-}" ]] && { has_existing=1; break; }
+  done
+  if (( has_existing == 1 )) && [[ -e /dev/tty && -r /dev/tty ]]; then
+    warn "regenerating any secret invalidates every client still using the old value"
+  fi
+
   for spec in \
       VLESS_UUID:gen_uuid \
       REALITY_SHORT_ID:gen_short_id \
       HYSTERIA2_PASSWORD:gen_password \
       HYSTERIA2_OBFS_PASSWORD:gen_password; do
     name="${spec%%:*}"; gen="${spec#*:}"
-    [[ -n "${!name:-}" ]] && continue
-    set_env "$name" "$($gen)"
-    ok "$name generated"
-    changed=1
+    if [[ -z "${!name:-}" ]]; then
+      set_env "$name" "$($gen)"
+      ok "$name generated"
+      changed=1
+    elif confirm_regen "$name"; then
+      set_env "$name" "$($gen)"
+      ok "$name regenerated"
+      changed=1
+    fi
   done
 
+  local need_kp=0
   if [[ -z "${REALITY_PRIVATE_KEY:-}" || -z "${REALITY_PUBLIC_KEY:-}" ]]; then
+    need_kp=1
+  elif confirm_regen "REALITY keypair"; then
+    need_kp=1
+  fi
+  if (( need_kp == 1 )); then
     local kp
     kp="$(gen_reality_keypair)"
     set_env REALITY_PRIVATE_KEY "$(awk '/PrivateKey/ {print $2}' <<< "$kp")"
     set_env REALITY_PUBLIC_KEY  "$(awk '/PublicKey/  {print $2}' <<< "$kp")"
-    ok "REALITY keypair generated"
+    ok "REALITY keypair (re)generated"
     changed=1
   fi
 
