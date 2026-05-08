@@ -76,6 +76,19 @@ CF_API_TOKEN=
 REALITY_DEST_SNI=www.apple.com
 REALITY_DEST_PORT=443
 
+# ---- Tailscale (optional) ------------------------------------------------
+# If TS_AUTH_KEY is set, sing-box exposes its built-in tailscale endpoint and
+# auto-routes 100.64.0.0/10, fd7a:115c:a1e0::/48, and *.ts.net through it —
+# clients connected to sing-box can reach your tailnet. Leave empty to skip.
+#
+# Pre-auth key: https://login.tailscale.com/admin/settings/keys
+# (a "Reusable, pre-approved" key is the typical fit for a server node)
+TS_AUTH_KEY=
+
+# Tailnet hostname for this node. Empty falls back to the first DNS label of
+# DOMAIN at render time (e.g. teleport.example.com → "teleport").
+TS_HOSTNAME=
+
 # ---- Generated secrets (filled in by `sing-box-ctl setup`) -------------
 # Do not edit by hand unless you intend to invalidate every existing client.
 VLESS_UUID=
@@ -382,8 +395,9 @@ EOF
 
 ufw_allow() { ufw allow "$1" comment "$2" >/dev/null; }
 
-# ufw drives the firewall; qrencode lets `share` render inline QR codes.
-SYSTEM_PKGS=(ufw qrencode)
+# ufw drives the firewall; qrencode lets `share` render inline QR codes;
+# jq patches the rendered config when optional features (tailscale) are on.
+SYSTEM_PKGS=(ufw qrencode jq)
 
 setup_packages() {
   header "System packages"
@@ -426,6 +440,47 @@ setup_ufw() {
 }
 
 # ─── render config ──────────────────────────────────────────────────────────
+# Patch the rendered config to add a tailscale endpoint, DNS server, and
+# route rule. Activated only when TS_AUTH_KEY is non-empty. Hostname falls
+# back to the first DNS label of DOMAIN.
+patch_config_tailscale() {
+  require_cmd jq
+  local host state tmp
+  host="${TS_HOSTNAME:-${DOMAIN%%.*}}"
+  state="$CACHE_DIR/tailscale"
+  mkdir -p "$state"
+  tmp="$(mktemp)"
+  jq \
+    --arg key   "$TS_AUTH_KEY" \
+    --arg host  "$host" \
+    --arg state "$state" '
+      .endpoints = ((.endpoints // []) + [{
+        type: "tailscale",
+        tag: "tailscale-ep",
+        auth_key: $key,
+        hostname: $host,
+        state_directory: $state,
+        ephemeral: false
+      }])
+      | .dns.servers += [{
+          tag: "tailscale-dns",
+          type: "tailscale",
+          endpoint: "tailscale-ep",
+          accept_default_resolvers: true
+        }]
+      | .dns.rules = ((.dns.rules // []) + [{
+          domain_suffix: ["ts.net"],
+          server: "tailscale-dns"
+        }])
+      | .route.rules = ([{
+          ip_cidr: ["100.64.0.0/10", "fd7a:115c:a1e0::/48"],
+          outbound: "tailscale-ep"
+        }] + (.route.rules // []))
+    ' "$CONFIG_FILE" > "$tmp"
+  install -m 0600 "$tmp" "$CONFIG_FILE"
+  rm -f "$tmp"
+}
+
 render_config() {
   require_cmd envsubst
   mkdir -p "$CONFIG_DIR" "$CACHE_DIR" "$CLIENT_DIR"
@@ -434,6 +489,11 @@ render_config() {
   ACME_DATA_DIR="$CACHE_DIR/acme" \
     envsubst < <(emit_config_tpl) > "$CONFIG_FILE"
   chmod 0600 "$CONFIG_FILE"
+  if [[ -n "${TS_AUTH_KEY:-}" ]]; then
+    step "Adding tailscale endpoint (hostname=${TS_HOSTNAME:-${DOMAIN%%.*}})"
+    patch_config_tailscale
+    ok "tailscale endpoint enabled"
+  fi
   step "Validating config"
   "$SINGBOX_BIN" check -c "$CONFIG_FILE" \
     || die "config validation failed — inspect $CONFIG_FILE"
@@ -489,6 +549,15 @@ configure_user_vars() {
     "Cloudflare API token (Zone.DNS:Edit + Zone.Zone:Read):"
   configure_var REALITY_DEST_SNI optional \
     "REALITY camouflage destination [www.apple.com]:"
+  configure_var TS_AUTH_KEY      optional \
+    "Tailscale auth key — enables tailnet egress (blank to skip):"
+  # Hostname only matters if a key was provided; default derives from DOMAIN.
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  if [[ -n "${TS_AUTH_KEY:-}" ]]; then
+    configure_var TS_HOSTNAME    optional \
+      "Tailnet hostname for this node [${DOMAIN%%.*}]:"
+  fi
 }
 
 # configure_var VARNAME required|optional PROMPT_TEXT

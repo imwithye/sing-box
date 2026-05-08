@@ -26,7 +26,9 @@ curl -fsSL https://raw.githubusercontent.com/imwithye/sing-box/main/install.sh \
       --domain=teleport.example.com \
       --email=you@example.com \
       --token=<CLOUDFLARE_API_TOKEN> \
-      [--sni=www.apple.com]
+      [--sni=www.apple.com] \
+      [--ts-authkey=<TAILSCALE_AUTH_KEY>] \
+      [--ts-hostname=<TAILNET_HOSTNAME>]
 ```
 
 Either way the installer:
@@ -45,6 +47,21 @@ Either way the installer:
 The Cloudflare API token needs `Zone.DNS:Edit` + `Zone.Zone:Read` on the
 zone for your domain. Make sure the DNS record is **DNS-only (gray
 cloud)** — sing-box protocols don't pass through Cloudflare's CDN.
+
+## Optional: Tailscale egress
+
+If you supply a Tailscale pre-auth key (interactive prompt, `--ts-authkey=`
+flag, or `TS_AUTH_KEY=` in `/etc/sing-box/env`), sing-box's built-in
+`tailscale` endpoint joins your tailnet and the rendered config auto-routes:
+
+- IPv4 `100.64.0.0/10` and IPv6 `fd7a:115c:a1e0::/48` → tailscale endpoint
+- DNS suffix `*.ts.net` (MagicDNS) → tailscale DNS server
+
+So clients connected to sing-box can reach tailnet IPs / MagicDNS names
+transparently. No `tailscaled` is installed — sing-box embeds tsnet
+directly. Get a key at <https://login.tailscale.com/admin/settings/keys>
+(a *reusable, pre-approved* key fits a long-lived server). Skip the prompt
+(blank line) to disable.
 
 ## Commands
 

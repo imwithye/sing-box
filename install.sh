@@ -27,17 +27,23 @@ DOMAIN_ARG=""
 EMAIL_ARG=""
 TOKEN_ARG=""
 SNI_ARG=""
+TS_AUTHKEY_ARG=""
+TS_HOSTNAME_ARG=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --domain=*) DOMAIN_ARG="${1#*=}" ;;
-    --domain)   shift; DOMAIN_ARG="${1:-}" ;;
-    --email=*)  EMAIL_ARG="${1#*=}" ;;
-    --email)    shift; EMAIL_ARG="${1:-}" ;;
-    --token=*)  TOKEN_ARG="${1#*=}" ;;
-    --token)    shift; TOKEN_ARG="${1:-}" ;;
-    --sni=*)    SNI_ARG="${1#*=}" ;;
-    --sni)      shift; SNI_ARG="${1:-}" ;;
+    --domain=*)      DOMAIN_ARG="${1#*=}" ;;
+    --domain)        shift; DOMAIN_ARG="${1:-}" ;;
+    --email=*)       EMAIL_ARG="${1#*=}" ;;
+    --email)         shift; EMAIL_ARG="${1:-}" ;;
+    --token=*)       TOKEN_ARG="${1#*=}" ;;
+    --token)         shift; TOKEN_ARG="${1:-}" ;;
+    --sni=*)         SNI_ARG="${1#*=}" ;;
+    --sni)           shift; SNI_ARG="${1:-}" ;;
+    --ts-authkey=*)  TS_AUTHKEY_ARG="${1#*=}" ;;
+    --ts-authkey)    shift; TS_AUTHKEY_ARG="${1:-}" ;;
+    --ts-hostname=*) TS_HOSTNAME_ARG="${1#*=}" ;;
+    --ts-hostname)   shift; TS_HOSTNAME_ARG="${1:-}" ;;
     -h|--help)
       cat <<USAGE
 Usage:
@@ -45,10 +51,12 @@ Usage:
   curl -fsSL .../install.sh | sudo bash -s -- [flags]
 
 Flags (all optional — missing values are prompted for interactively):
-  --domain=DOMAIN     domain pointing at this VPS, DNS-only on Cloudflare
-  --email=EMAIL       contact email for Let's Encrypt registration
-  --token=TOKEN       Cloudflare API token (Zone.DNS:Edit + Zone.Zone:Read)
-  --sni=SNI           REALITY camouflage destination (default www.apple.com)
+  --domain=DOMAIN        domain pointing at this VPS, DNS-only on Cloudflare
+  --email=EMAIL          contact email for Let's Encrypt registration
+  --token=TOKEN          Cloudflare API token (Zone.DNS:Edit + Zone.Zone:Read)
+  --sni=SNI              REALITY camouflage destination (default www.apple.com)
+  --ts-authkey=KEY       Tailscale pre-auth key — enables tailnet egress (optional)
+  --ts-hostname=NAME     Tailnet hostname for this node (optional, defaults to first DNS label)
 USAGE
       exit 0
       ;;
@@ -79,5 +87,7 @@ export SINGBOX_DOMAIN="$DOMAIN_ARG"
 export SINGBOX_ACME_EMAIL="$EMAIL_ARG"
 export SINGBOX_CF_API_TOKEN="$TOKEN_ARG"
 export SINGBOX_REALITY_DEST_SNI="$SNI_ARG"
+export SINGBOX_TS_AUTH_KEY="$TS_AUTHKEY_ARG"
+export SINGBOX_TS_HOSTNAME="$TS_HOSTNAME_ARG"
 
 exec "$WRAPPER_BIN" setup
