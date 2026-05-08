@@ -540,7 +540,11 @@ configure_user_vars() {
 configure_var() {
   local var="$1" mode="$2" prompt="$3"
 
-  local fb_var="SINGBOX_${var}" fb="${!fb_var:-}"
+  # Split: bash expands `${!fb_var}` *before* the local runs, so combining
+  # both into one `local` line evaluates the indirect lookup before fb_var
+  # is bound — fails with "invalid indirect expansion".
+  local fb_var="SINGBOX_${var}"
+  local fb="${!fb_var:-}"
   if [[ -n "$fb" ]]; then
     set_env "$var" "$fb"
     ok "$var ← (from \$$fb_var)"
