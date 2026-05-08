@@ -184,6 +184,7 @@ emit_config_tpl() {
     }
   ],
   "route": {
+    "default_domain_resolver": "cloudflare-doh",
     "rules": [
       {
         "ip_is_private": true,
@@ -595,13 +596,24 @@ confirm_regen() {
   [[ "$reply" =~ ^[Yy] ]]
 }
 
+# maybe_regen NAME GENERATOR — generate if empty, prompt to regen otherwise.
+maybe_regen() {
+  local name="$1" gen="$2"
+  if [[ -z "${!name:-}" ]]; then
+    set_env "$name" "$($gen)"
+    ok "$name generated"
+  elif confirm_regen "$name"; then
+    set_env "$name" "$($gen)"
+    ok "$name regenerated"
+  fi
+}
+
 # Empty secrets are auto-generated. Existing ones prompt y/N to regenerate
 # (default keep). Regen invalidates clients still using the old value.
 # Caller (cmd_setup) must have sourced $ENV_FILE first; set_env exports
 # keep our view in sync as we go.
 fill_secrets() {
-  local changed=0 spec name gen v
-
+  local v
   for v in VLESS_UUID REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY \
            REALITY_SHORT_ID HYSTERIA2_PASSWORD HYSTERIA2_OBFS_PASSWORD; do
     if [[ -n "${!v:-}" ]] && [[ -e /dev/tty && -r /dev/tty ]]; then
@@ -610,23 +622,10 @@ fill_secrets() {
     fi
   done
 
-  for spec in \
-      VLESS_UUID:gen_uuid \
-      REALITY_SHORT_ID:gen_short_id \
-      HYSTERIA2_PASSWORD:gen_password \
-      HYSTERIA2_OBFS_PASSWORD:gen_password; do
-    name="${spec%%:*}"; gen="${spec#*:}"
-    if [[ -z "${!name:-}" ]]; then
-      set_env "$name" "$($gen)"
-      ok "$name generated"
-      changed=1
-    elif confirm_regen "$name"; then
-      set_env "$name" "$($gen)"
-      ok "$name regenerated"
-      changed=1
-    fi
-  done
-
+  # REALITY-VLESS group (UUID, short ID, keypair) kept together so a user
+  # rotating REALITY can answer y to all three in a row.
+  maybe_regen VLESS_UUID       gen_uuid
+  maybe_regen REALITY_SHORT_ID gen_short_id
   if [[ -z "${REALITY_PRIVATE_KEY:-}" || -z "${REALITY_PUBLIC_KEY:-}" ]] \
      || confirm_regen "REALITY keypair"; then
     local kp
@@ -634,13 +633,11 @@ fill_secrets() {
     set_env REALITY_PRIVATE_KEY "$(awk '/PrivateKey/ {print $2}' <<< "$kp")"
     set_env REALITY_PUBLIC_KEY  "$(awk '/PublicKey/  {print $2}' <<< "$kp")"
     ok "REALITY keypair (re)generated"
-    changed=1
   fi
 
-  # `(( cond )) && cmd` as last statement aborts under set -e when cond is false.
-  if (( changed == 0 )); then
-    ok "all secrets already populated"
-  fi
+  # Hysteria2 group.
+  maybe_regen HYSTERIA2_PASSWORD      gen_password
+  maybe_regen HYSTERIA2_OBFS_PASSWORD gen_password
 }
 
 cmd_setup() {
