@@ -459,6 +459,9 @@ patch_config_tailscale() {
           server: "tailscale-dns"
         }])
       | .route.rules = ([{
+          domain_suffix: ["ts.net"],
+          outbound: "tailscale-ep"
+        }, {
           ip_cidr: ["100.64.0.0/10", "fd7a:115c:a1e0::/48"],
           outbound: "tailscale-ep"
         }] + (.route.rules // []))
