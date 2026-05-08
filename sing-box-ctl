@@ -231,6 +231,8 @@ load_env() {
   set +a
 }
 
+# Writes KEY=VAL into $ENV_FILE (in-place if KEY exists, appended otherwise)
+# and exports it so callers see the new value without re-sourcing.
 set_env() {
   local key="$1" val="$2"
   [[ "$val" != *$'\n'* ]] || die "set_env: value for $key contains newline"
@@ -242,6 +244,7 @@ set_env() {
   else
     printf '%s=%s\n' "$key" "$val" >> "$ENV_FILE"
   fi
+  export "$key=$val"
 }
 
 require_vars() {
@@ -271,28 +274,12 @@ CLIENT_VARS=(
 )
 
 # ─── secret generators ──────────────────────────────────────────────────────
-gen_uuid() {
-  if [[ -x "$SINGBOX_BIN" ]]; then
-    "$SINGBOX_BIN" generate uuid | tr -d '\r\n'
-  elif [[ -r /proc/sys/kernel/random/uuid ]]; then
-    cat /proc/sys/kernel/random/uuid
-  else
-    die "cannot generate UUID — install sing-box first"
-  fi
-}
-
-gen_reality_keypair() {
-  [[ -x "$SINGBOX_BIN" ]] || die "sing-box binary missing — run 'sing-box-ctl setup' first"
-  "$SINGBOX_BIN" generate reality-keypair
-}
-
-gen_short_id() {
-  openssl rand -hex 8
-}
-
-gen_password() {
-  openssl rand -base64 24 | tr -d '=+/\n' | cut -c1-24
-}
+# Only ever called from fill_secrets, which runs after install_singbox_binary,
+# so $SINGBOX_BIN is always present.
+gen_uuid()            { "$SINGBOX_BIN" generate uuid | tr -d '\r\n'; }
+gen_reality_keypair() { "$SINGBOX_BIN" generate reality-keypair; }
+gen_short_id()        { openssl rand -hex 8; }
+gen_password()        { openssl rand -base64 24 | tr -d '=+/\n' | cut -c1-24; }
 
 # ─── arch detection ─────────────────────────────────────────────────────────
 detect_arch() {
@@ -445,12 +432,10 @@ setup_ufw() {
 # back to the first DNS label of DOMAIN.
 patch_config_tailscale() {
   require_cmd jq
-  local host state tmp
-  host="${TS_HOSTNAME:-${DOMAIN%%.*}}"
-  state="$CACHE_DIR/tailscale"
+  local host="${TS_HOSTNAME:-${DOMAIN%%.*}}" state="$CACHE_DIR/tailscale"
   mkdir -p "$state"
-  tmp="$(mktemp)"
-  jq \
+  local patched
+  patched=$(jq \
     --arg key   "$TS_AUTH_KEY" \
     --arg host  "$host" \
     --arg state "$state" '
@@ -476,9 +461,8 @@ patch_config_tailscale() {
           ip_cidr: ["100.64.0.0/10", "fd7a:115c:a1e0::/48"],
           outbound: "tailscale-ep"
         }] + (.route.rules // []))
-    ' "$CONFIG_FILE" > "$tmp"
-  install -m 0600 "$tmp" "$CONFIG_FILE"
-  rm -f "$tmp"
+    ' "$CONFIG_FILE")
+  printf '%s\n' "$patched" > "$CONFIG_FILE"
 }
 
 render_config() {
@@ -525,49 +509,24 @@ qr_common_version() {
 }
 
 # ─── subcommands ────────────────────────────────────────────────────────────
-# Returns 0 if DOMAIN, ACME_EMAIL, CF_API_TOKEN are set + non-empty in $ENV_FILE.
-env_has_required() {
-  local v
-  for v in DOMAIN ACME_EMAIL CF_API_TOKEN; do
-    grep -q "^${v}=..*$" "$ENV_FILE" || return 1
-  done
-  return 0
-}
-
-# For DOMAIN / ACME_EMAIL / CF_API_TOKEN / REALITY_DEST_SNI: if empty in
-# $ENV_FILE, prefer the matching SINGBOX_<VAR> env var (set by install.sh
-# from --domain/--email/--token/--sni flags), otherwise prompt on /dev/tty.
 configure_user_vars() {
   # shellcheck disable=SC1090
   source "$ENV_FILE"
 
-  configure_var DOMAIN          required \
+  configure_var DOMAIN           required \
     "Domain pointing at this VPS (DNS-only on Cloudflare)"
-  configure_var ACME_EMAIL      required \
+  configure_var ACME_EMAIL       required \
     "Contact email for Let's Encrypt registration"
-  configure_var CF_API_TOKEN    required \
+  configure_var CF_API_TOKEN     required \
     "Cloudflare API token (Zone.DNS:Edit + Zone.Zone:Read)"
   configure_var REALITY_DEST_SNI optional \
     "REALITY camouflage destination"
   configure_var TS_AUTH_KEY      optional \
     "Tailscale auth key — enables tailnet egress (blank to skip)"
-  # Hostname only matters if a key was provided; default derives from DOMAIN.
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
+  # set_env exports, so TS_AUTH_KEY/DOMAIN are visible here without re-sourcing.
   if [[ -n "${TS_AUTH_KEY:-}" ]]; then
     configure_var TS_HOSTNAME    optional \
       "Tailnet hostname (defaults to ${DOMAIN%%.*} if blank)"
-  fi
-}
-
-# Truncate long values to first8…last8 so secrets don't overflow the prompt
-# while still letting the user verify the right value is loaded.
-display_value() {
-  local v="$1"
-  if (( ${#v} > 30 )); then
-    printf '%s…%s' "${v:0:8}" "${v: -8}"
-  else
-    printf '%s' "$v"
   fi
 }
 
@@ -575,14 +534,13 @@ display_value() {
 #
 # Resolution order:
 #   1. SINGBOX_<VAR> override (set by install.sh flags) always wins.
-#   2. TTY: prompt with current value as `[placeholder]` — Enter keeps the
-#      existing value, anything else replaces it. Required + empty re-asks.
+#   2. TTY: prompt with current value as `[placeholder]` — Enter keeps it,
+#      anything else replaces it. Required + empty re-asks.
 #   3. No TTY: keep existing value, or die if required and empty.
 configure_var() {
   local var="$1" mode="$2" prompt="$3"
 
-  local fb_var="SINGBOX_${var}"
-  local fb="${!fb_var:-}"
+  local fb_var="SINGBOX_${var}" fb="${!fb_var:-}"
   if [[ -n "$fb" ]]; then
     set_env "$var" "$fb"
     ok "$var ← (from \$$fb_var)"
@@ -591,35 +549,36 @@ configure_var() {
 
   local current="${!var:-}"
 
-  if [[ -e /dev/tty && -r /dev/tty ]]; then
-    local value display
-    display="$(display_value "$current")"
-    while true; do
-      if [[ -n "$current" ]]; then
-        ask "$prompt [$display]:"
-      else
-        ask "$prompt:"
-      fi
-      read -r value </dev/tty || value=""
-      if [[ -z "$value" ]]; then
-        if [[ -n "$current" ]]; then
-          ok "$var unchanged"
-          return 0
-        fi
-        [[ "$mode" == "optional" ]] && return 0
-        err "$var cannot be empty"
-        continue
-      fi
+  if [[ ! -e /dev/tty || ! -r /dev/tty ]]; then
+    [[ "$mode" == "required" && -z "$current" ]] \
+      && die "$var is empty and no TTY for prompt — set $fb_var or rerun on a TTY"
+    return 0
+  fi
+
+  # Truncate long values (tokens, keys) to first8…last8 in the placeholder.
+  local display="$current"
+  (( ${#display} > 30 )) && display="${current:0:8}…${current: -8}"
+
+  local value
+  while true; do
+    if [[ -n "$current" ]]; then
+      ask "$prompt [$display]:"
+    else
+      ask "$prompt:"
+    fi
+    read -r value </dev/tty || value=""
+    if [[ -n "$value" ]]; then
       set_env "$var" "$value"
       ok "$var updated"
       return 0
-    done
-  fi
-
-  if [[ "$mode" == "required" && -z "$current" ]]; then
-    die "$var is empty and no TTY for prompt — set $fb_var or rerun on a TTY"
-  fi
-  return 0
+    fi
+    if [[ -n "$current" ]]; then
+      ok "$var unchanged"
+      return 0
+    fi
+    [[ "$mode" == "optional" ]] && return 0
+    err "$var cannot be empty"
+  done
 }
 
 # Returns 0 if the user interactively confirms regenerating $1.
@@ -634,18 +593,18 @@ confirm_regen() {
 
 # Empty secrets are auto-generated. Existing ones prompt y/N to regenerate
 # (default keep). Regen invalidates clients still using the old value.
+# Caller (cmd_setup) must have sourced $ENV_FILE first; set_env exports
+# keep our view in sync as we go.
 fill_secrets() {
-  # shellcheck disable=SC1090
-  source "$ENV_FILE"
-  local changed=0 spec name gen v has_existing=0
+  local changed=0 spec name gen v
 
   for v in VLESS_UUID REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY \
            REALITY_SHORT_ID HYSTERIA2_PASSWORD HYSTERIA2_OBFS_PASSWORD; do
-    [[ -n "${!v:-}" ]] && { has_existing=1; break; }
+    if [[ -n "${!v:-}" ]] && [[ -e /dev/tty && -r /dev/tty ]]; then
+      warn "regenerating any secret invalidates every client still using the old value"
+      break
+    fi
   done
-  if (( has_existing == 1 )) && [[ -e /dev/tty && -r /dev/tty ]]; then
-    warn "regenerating any secret invalidates every client still using the old value"
-  fi
 
   for spec in \
       VLESS_UUID:gen_uuid \
@@ -664,13 +623,8 @@ fill_secrets() {
     fi
   done
 
-  local need_kp=0
-  if [[ -z "${REALITY_PRIVATE_KEY:-}" || -z "${REALITY_PUBLIC_KEY:-}" ]]; then
-    need_kp=1
-  elif confirm_regen "REALITY keypair"; then
-    need_kp=1
-  fi
-  if (( need_kp == 1 )); then
+  if [[ -z "${REALITY_PRIVATE_KEY:-}" || -z "${REALITY_PUBLIC_KEY:-}" ]] \
+     || confirm_regen "REALITY keypair"; then
     local kp
     kp="$(gen_reality_keypair)"
     set_env REALITY_PRIVATE_KEY "$(awk '/PrivateKey/ {print $2}' <<< "$kp")"
@@ -722,14 +676,10 @@ cmd_setup() {
   configure_user_vars
   fill_secrets
 
-  if env_has_required; then
-    header "env file complete — bringing up service"
-    cmd_up
-  else
-    header "Next steps"
-    hint "1. edit $ENV_FILE — set DOMAIN, ACME_EMAIL, CF_API_TOKEN"
-    hint "2. sudo sing-box-ctl up"
-  fi
+  # configure_user_vars enforces the required vars (or dies); no need to
+  # re-check before bringing the service up.
+  header "Bringing up service"
+  cmd_up
 }
 
 cmd_up() {
@@ -849,7 +799,7 @@ cmd_purge() {
   hint "    cloudflare A/AAAA record + API token"
   hint "    let's encrypt account on LE side (local key under cache/ is wiped; certs auto-expire in 90d)"
   hint "    /etc/sysctl.d/99-bbr.conf, tcp_bbr module"
-  hint "    qrencode + ufw apt packages"
+  hint "    ufw + qrencode + jq apt packages"
 
   [[ -e /dev/tty && -r /dev/tty ]] || die "purge needs a TTY for confirmation"
   printf '\n'
@@ -922,7 +872,7 @@ usage() {
   hint "sudo sing-box-ctl <command> [args]"
 
   header "Commands"
-  row "setup"          "Install everything: BBR, apt deps (ufw + qrencode), UFW rules, sing-box binary, unit, wrapper, secrets"
+  row "setup"          "Install everything: BBR, apt deps (ufw + qrencode + jq), UFW rules, sing-box binary, unit, wrapper, secrets"
   row "up"             "Render config + (re)start service"
   row "down"           "Stop service"
   row "logs"           "journalctl -fu sing-box"

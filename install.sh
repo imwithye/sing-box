@@ -1,19 +1,9 @@
 #!/usr/bin/env bash
 # install.sh — one-line bootstrapper for the sing-box-ctl wrapper.
 #
-# Pipe via curl. With no args it falls back to an interactive setup that
-# prompts for DOMAIN / ACME_EMAIL / CF_API_TOKEN. With flags it runs
-# end-to-end without prompts.
-#
-# Interactive:
-#   curl -fsSL https://raw.githubusercontent.com/imwithye/sing-box/main/install.sh | sudo bash
-#
-# One-shot:
-#   curl -fsSL https://raw.githubusercontent.com/imwithye/sing-box/main/install.sh \
-#     | sudo bash -s -- --domain=teleport.example.com \
-#                       --email=you@example.com \
-#                       --token=<cloudflare-api-token> \
-#                       [--sni=www.apple.com]
+# Pipe via curl. Without flags, setup prompts for any missing fields;
+# anything passed via flags is forwarded as SINGBOX_<VAR> env vars and
+# pre-fills the corresponding setup prompt. See `--help` for the full list.
 
 set -euo pipefail
 

@@ -34,8 +34,9 @@ curl -fsSL https://raw.githubusercontent.com/imwithye/sing-box/main/install.sh \
 Either way the installer:
 
 1. Enables TCP BBR (`/etc/sysctl.d/99-bbr.conf`).
-2. Installs `ufw` + `qrencode` via apt, then configures UFW:
+2. Installs `ufw` + `qrencode` + `jq` via apt, then configures UFW:
    `deny in / allow out`, plus `22/tcp + 443/tcp + 443/udp`.
+   (`jq` patches in the Tailscale endpoint when enabled.)
 3. Downloads the latest sing-box release for your arch
    (`linux-amd64`/`arm64`) into `/usr/local/bin/sing-box`.
 4. Installs the systemd unit + enables it.
