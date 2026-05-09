@@ -14,6 +14,7 @@ REPO_DL="${SINGBOX_REPO_DL:-https://github.com/SagerNet/sing-box}"
 CONFIG_DIR="${SINGBOX_CONFIG_DIR:-/etc/sing-box}"
 ENV_FILE="$CONFIG_DIR/env"
 CONFIG_FILE="$CONFIG_DIR/config.json"
+TSEXIT_FILE="$CONFIG_DIR/tsexit"
 CACHE_DIR="$CONFIG_DIR/cache"
 CLIENT_DIR="$CONFIG_DIR/client"
 UNIT_FILE="/etc/systemd/system/sing-box.service"
@@ -102,6 +103,56 @@ REALITY_SHORT_ID=
 HYSTERIA2_PASSWORD=
 HYSTERIA2_OBFS_PASSWORD=
 TPL
+}
+
+emit_tsexit_template() {
+  cat <<'TPL'
+# /etc/sing-box/tsexit — additional destinations to route through tailscale-ep.
+#
+# Only effective when TS_AUTH_KEY is set in /etc/sing-box/env.
+# When TS_EXIT_NODE is also set, matched traffic egresses through that
+# tailnet peer; otherwise it goes via direct tsnet routing.
+#
+# One entry per line. Comments start with #. Blank lines ignored.
+#   Domains:    example.com   *.example.com   (suffix-matched; *. stripped)
+#   IPv4/CIDR:  1.2.3.4       10.0.0.0/8      (bare IP → /32)
+#   IPv6/CIDR:  2001:db8::1   2001:db8::/32   (bare IP → /128)
+#
+# Re-read at every `sing-box-ctl up`.
+#
+# Examples (uncomment to use):
+# netflix.com
+# *.bbc.co.uk
+# 203.0.113.0/24
+TPL
+}
+
+# parse_tsexit — splits $TSEXIT_FILE into TSEXIT_DOMAINS / TSEXIT_CIDRS arrays.
+# Missing or all-comment file leaves both empty.
+#   blank lines + #-comments  → skipped
+#   IPv4 (with optional /N)   → CIDRS; bare IP gets /32
+#   IPv6 (with optional /N)   → CIDRS; bare IP gets /128
+#   anything else             → DOMAINS; leading "*." stripped
+parse_tsexit() {
+  TSEXIT_DOMAINS=()
+  TSEXIT_CIDRS=()
+  [[ -f "$TSEXIT_FILE" ]] || return 0
+  local raw entry
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    entry="${raw#"${raw%%[![:space:]]*}"}"
+    entry="${entry%"${entry##*[![:space:]]}"}"
+    [[ -z "$entry" || "$entry" == \#* ]] && continue
+    if [[ "$entry" =~ ^[0-9]+(\.[0-9]+){3}(/[0-9]+)?$ ]]; then
+      [[ "$entry" == */* ]] || entry="${entry}/32"
+      TSEXIT_CIDRS+=("$entry")
+    elif [[ "$entry" == *:* ]]; then
+      [[ "$entry" == */* ]] || entry="${entry}/128"
+      TSEXIT_CIDRS+=("$entry")
+    else
+      [[ "$entry" == \*.* ]] && entry="${entry#\*.}"
+      TSEXIT_DOMAINS+=("$entry")
+    fi
+  done < "$TSEXIT_FILE"
 }
 
 emit_config_tpl() {
@@ -439,12 +490,28 @@ patch_config_tailscale() {
   require_cmd jq
   local host="${TS_HOSTNAME:-${DOMAIN%%.*}}" state="$CACHE_DIR/tailscale"
   mkdir -p "$state"
+
+  parse_tsexit
+  local domains_json cidrs_json
+  if (( ${#TSEXIT_DOMAINS[@]} == 0 )); then
+    domains_json='[]'
+  else
+    domains_json=$(printf '%s\n' "${TSEXIT_DOMAINS[@]}" | jq -R . | jq -s .)
+  fi
+  if (( ${#TSEXIT_CIDRS[@]} == 0 )); then
+    cidrs_json='[]'
+  else
+    cidrs_json=$(printf '%s\n' "${TSEXIT_CIDRS[@]}" | jq -R . | jq -s .)
+  fi
+
   local patched
   patched=$(jq \
-    --arg key   "$TS_AUTH_KEY" \
-    --arg host  "$host" \
-    --arg state "$state" \
-    --arg exit  "${TS_EXIT_NODE:-}" '
+    --arg     key     "$TS_AUTH_KEY" \
+    --arg     host    "$host" \
+    --arg     state   "$state" \
+    --arg     exit    "${TS_EXIT_NODE:-}" \
+    --argjson domains "$domains_json" \
+    --argjson cidrs   "$cidrs_json" '
       .endpoints = ((.endpoints // []) + [
         ({
           type: "tailscale",
@@ -462,14 +529,14 @@ patch_config_tailscale() {
           accept_default_resolvers: true
         }]
       | .dns.rules = ((.dns.rules // []) + [{
-          domain_suffix: ["ts.net"],
+          domain_suffix: (["ts.net"] + $domains),
           server: "tailscale-dns"
         }])
       | .route.rules = ([{
-          domain_suffix: ["ts.net"],
+          domain_suffix: (["ts.net"] + $domains),
           outbound: "tailscale-ep"
         }, {
-          ip_cidr: ["100.64.0.0/10", "fd7a:115c:a1e0::/48"],
+          ip_cidr: (["100.64.0.0/10", "fd7a:115c:a1e0::/48"] + $cidrs),
           outbound: "tailscale-ep"
         }] + (.route.rules // []))
     ' "$CONFIG_FILE")
@@ -487,7 +554,11 @@ render_config() {
   if [[ -n "${TS_AUTH_KEY:-}" ]]; then
     step "Adding tailscale endpoint (hostname=${TS_HOSTNAME:-${DOMAIN%%.*}})"
     patch_config_tailscale
-    ok "tailscale endpoint enabled"
+    if (( ${#TSEXIT_DOMAINS[@]} + ${#TSEXIT_CIDRS[@]} > 0 )); then
+      ok "tailscale endpoint enabled (+${#TSEXIT_DOMAINS[@]} domain, ${#TSEXIT_CIDRS[@]} cidr from $TSEXIT_FILE)"
+    else
+      ok "tailscale endpoint enabled"
+    fi
   fi
   step "Validating config"
   "$SINGBOX_BIN" check -c "$CONFIG_FILE" \
@@ -685,6 +756,13 @@ cmd_setup() {
     ok "wrote $ENV_FILE template"
   else
     ok "$ENV_FILE already exists"
+  fi
+  if [[ ! -f "$TSEXIT_FILE" ]]; then
+    emit_tsexit_template > "$TSEXIT_FILE"
+    chmod 0600 "$TSEXIT_FILE"
+    ok "wrote $TSEXIT_FILE template (empty by default)"
+  else
+    ok "$TSEXIT_FILE already exists"
   fi
   configure_user_vars
   fill_secrets

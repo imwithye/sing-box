@@ -70,6 +70,11 @@ Optional knobs (all skip-able with a blank prompt):
   label of `DOMAIN`).
 - `TS_EXIT_NODE` — name or `100.x` IP of a tailnet peer to route
   `tailscale-ep` traffic through. Empty means direct peer-to-peer.
+- `/etc/sing-box/tsexit` — extra destinations to route through
+  `tailscale-ep`. One entry per line, `#` for comments. Domains
+  (`netflix.com`, `*.bbc.co.uk`) are suffix-matched; bare IPs become
+  `/32` (v4) or `/128` (v6); CIDRs pass through. Generated empty by
+  `setup`; re-read on every `up`.
 
 ## Commands
 
@@ -94,6 +99,7 @@ purge          tear down the deployment (service + binaries + config + 443 ufw r
 /usr/local/bin/sing-box         upstream binary (downloaded by `setup`)
 /etc/systemd/system/sing-box.service
 /etc/sing-box/env               secrets (mode 0600)
+/etc/sing-box/tsexit            extra tailscale-ep routes (0600, optional)
 /etc/sing-box/config.json       rendered sing-box config (0640)
 /etc/sing-box/cache/            ACME certs + sing-box runtime state
 /etc/sing-box/client/           subscription.{txt,b64}
