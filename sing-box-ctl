@@ -89,6 +89,10 @@ TS_AUTH_KEY=
 # DOMAIN at render time (e.g. teleport.example.com → "teleport").
 TS_HOSTNAME=
 
+# Tailscale exit node — name or 100.x IP of a tailnet peer to route the
+# tailscale endpoint's traffic through. Empty = direct peer-to-peer routing.
+TS_EXIT_NODE=
+
 # ---- Generated secrets (filled in by `sing-box-ctl setup`) -------------
 # Do not edit by hand unless you intend to invalidate every existing client.
 VLESS_UUID=
@@ -439,15 +443,18 @@ patch_config_tailscale() {
   patched=$(jq \
     --arg key   "$TS_AUTH_KEY" \
     --arg host  "$host" \
-    --arg state "$state" '
-      .endpoints = ((.endpoints // []) + [{
-        type: "tailscale",
-        tag: "tailscale-ep",
-        auth_key: $key,
-        hostname: $host,
-        state_directory: $state,
-        ephemeral: false
-      }])
+    --arg state "$state" \
+    --arg exit  "${TS_EXIT_NODE:-}" '
+      .endpoints = ((.endpoints // []) + [
+        ({
+          type: "tailscale",
+          tag: "tailscale-ep",
+          auth_key: $key,
+          hostname: $host,
+          state_directory: $state,
+          ephemeral: false
+        } + (if $exit == "" then {} else {exit_node: $exit} end))
+      ])
       | .dns.servers += [{
           tag: "tailscale-dns",
           type: "tailscale",
@@ -531,6 +538,8 @@ configure_user_vars() {
   if [[ -n "${TS_AUTH_KEY:-}" ]]; then
     configure_var TS_HOSTNAME    optional \
       "Tailnet hostname (defaults to ${DOMAIN%%.*} if blank)"
+    configure_var TS_EXIT_NODE   optional \
+      "Tailscale exit node name or 100.x IP (blank for direct routing)"
   fi
 }
 

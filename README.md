@@ -64,6 +64,13 @@ directly. Get a key at <https://login.tailscale.com/admin/settings/keys>
 (a *reusable, pre-approved* key fits a long-lived server). Skip the prompt
 (blank line) to disable.
 
+Optional knobs (all skip-able with a blank prompt):
+
+- `TS_HOSTNAME` — node name on the tailnet (defaults to the first DNS
+  label of `DOMAIN`).
+- `TS_EXIT_NODE` — name or `100.x` IP of a tailnet peer to route
+  `tailscale-ep` traffic through. Empty means direct peer-to-peer.
+
 ## Commands
 
 Eight commands, all root-only:
