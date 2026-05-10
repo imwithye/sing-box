@@ -504,6 +504,10 @@ patch_config_tailscale() {
     cidrs_json=$(printf '%s\n' "${TSEXIT_CIDRS[@]}" | jq -R . | jq -s .)
   fi
 
+  # Note: tsexit $domains intentionally only patched into route.rules, never
+  # dns.rules. Letting public domains resolve via the exit node's tailnet DNS
+  # breaks Claude web (TLS errors); cloudflare-doh + tailscale-ep route works.
+  # Reconfirmed 2026-05-10 — do not re-add $domains to the DNS rule.
   local patched
   patched=$(jq \
     --arg     key     "$TS_AUTH_KEY" \
@@ -529,7 +533,7 @@ patch_config_tailscale() {
           accept_default_resolvers: true
         }]
       | .dns.rules = ((.dns.rules // []) + [{
-          domain_suffix: (["ts.net"] + $domains),
+          domain_suffix: ["ts.net"],
           server: "tailscale-dns"
         }])
       | .route.rules = ([{
