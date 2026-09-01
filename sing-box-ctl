@@ -162,6 +162,20 @@ emit_config_tpl() {
     "level": "warn",
     "timestamp": true
   },
+  "certificate_providers": [
+    {
+      "type": "acme",
+      "tag": "acme",
+      "domain": ["${DOMAIN}"],
+      "data_directory": "${ACME_DATA_DIR}",
+      "default_server_name": "${DOMAIN}",
+      "email": "${ACME_EMAIL}",
+      "dns01_challenge": {
+        "provider": "cloudflare",
+        "api_token": "${CF_API_TOKEN}"
+      }
+    }
+  ],
   "dns": {
     "servers": [
       {
@@ -219,16 +233,7 @@ emit_config_tpl() {
         "enabled": true,
         "server_name": "${DOMAIN}",
         "alpn": ["h3"],
-        "acme": {
-          "domain": ["${DOMAIN}"],
-          "data_directory": "${ACME_DATA_DIR}",
-          "default_server_name": "${DOMAIN}",
-          "email": "${ACME_EMAIL}",
-          "dns01_challenge": {
-            "provider": "cloudflare",
-            "api_token": "${CF_API_TOKEN}"
-          }
-        }
+        "certificate_provider": "acme"
       }
     }
   ],
@@ -489,7 +494,11 @@ setup_ufw() {
 patch_config_tailscale() {
   require_cmd jq
   local host="${TS_HOSTNAME:-${DOMAIN%%.*}}" state="$CACHE_DIR/tailscale"
-  mkdir -p "$state"
+  # taildrop_directory (sing-box 1.14.0+) defaults to a relative "Taildrop",
+  # which resolves against the unit's working directory (/) and fails under
+  # ProtectSystem=strict — pin it inside the cache dir instead.
+  local taildrop="$state/Taildrop"
+  mkdir -p "$state" "$taildrop"
 
   parse_tsexit
   local domains_json cidrs_json
@@ -513,6 +522,7 @@ patch_config_tailscale() {
     --arg     key     "$TS_AUTH_KEY" \
     --arg     host    "$host" \
     --arg     state   "$state" \
+    --arg     taildrop "$taildrop" \
     --arg     exit    "${TS_EXIT_NODE:-}" \
     --argjson domains "$domains_json" \
     --argjson cidrs   "$cidrs_json" '
@@ -523,6 +533,7 @@ patch_config_tailscale() {
           auth_key: $key,
           hostname: $host,
           state_directory: $state,
+          taildrop_directory: $taildrop,
           ephemeral: false
         } + (if $exit == "" then {} else {exit_node: $exit} end))
       ])
