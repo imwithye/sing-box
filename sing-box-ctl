@@ -45,6 +45,9 @@ err()     { printf '  %s✗%s %s\n' "${C_RED}"    "${C_RESET}" "$*" >&2; }
 hint()    { printf '  %s%s%s\n'   "${C_DIM}"    "$*"        "${C_RESET}"; }
 ask()     { printf '  %s?%s %s '  "${C_BLUE}"   "${C_RESET}" "$*"; }
 has_tty() { [[ -e /dev/tty && -r /dev/tty ]]; }
+# read_tty VARNAME — read one line from the terminal into VARNAME, empty on
+# EOF. Prompts read /dev/tty, not stdin, so `curl | bash` can still ask.
+read_tty() { read -r "$1" </dev/tty || printf -v "$1" '%s' ""; }
 die()     { err "$*"; exit 1; }
 
 # ─── prerequisites ──────────────────────────────────────────────────────────
@@ -326,6 +329,10 @@ set_env() {
   fi
   export "$key=$val"
 }
+
+# Typed at an optional prompt (or passed as SINGBOX_<VAR>) to blank a value
+# that is already set — plain Enter means "keep", so it can't do double duty.
+CLEAR_SENTINEL="-"
 
 # Truthy test for TS_ENABLED. Installs predating that key have no such line;
 # there, a non-empty TS_AUTH_KEY was what turned tailscale on, so honour it.
@@ -720,6 +727,10 @@ configure_tailscale_vars() {
 #   2. TTY: prompt with current value as `[placeholder]` — Enter keeps it,
 #      anything else replaces it. Required + empty re-asks.
 #   3. No TTY: keep existing value, or die if required and empty.
+#
+# Enter meaning "keep" leaves no way to empty a var that already has a value,
+# so optional vars also accept CLEAR_SENTINEL (via prompt or override) to
+# blank them out.
 configure_var() {
   local var="$1" mode="$2" prompt="$3"
 
@@ -729,6 +740,11 @@ configure_var() {
   local fb_var="SINGBOX_${var}"
   local fb="${!fb_var:-}"
   if [[ -n "$fb" ]]; then
+    if [[ "$mode" == "optional" && "$fb" == "$CLEAR_SENTINEL" ]]; then
+      set_env "$var" ""
+      ok "$var cleared (from \$$fb_var)"
+      return 0
+    fi
     set_env "$var" "$fb"
     ok "$var ← (from \$$fb_var)"
     return 0
@@ -746,14 +762,27 @@ configure_var() {
   local display="$current"
   (( ${#display} > 30 )) && display="${current:0:8}…${current: -8}"
 
+  # Only advertise clearing where it is allowed, and only where there is
+  # something to clear.
+  local clear_hint=""
+  [[ "$mode" != "optional" || -z "$current" ]] \
+    || clear_hint=" ($CLEAR_SENTINEL to clear)"
+
   local value
   while true; do
     if [[ -n "$current" ]]; then
-      ask "$prompt [$display]:"
+      ask "$prompt [$display]$clear_hint:"
     else
       ask "$prompt:"
     fi
-    read -r value </dev/tty || value=""
+    read_tty value
+    # Clearing an already-empty var is a no-op, so accept the sentinel at
+    # every optional prompt even where the hint isn't shown.
+    if [[ "$mode" == "optional" && "$value" == "$CLEAR_SENTINEL" ]]; then
+      set_env "$var" ""
+      ok "$var cleared"
+      return 0
+    fi
     if [[ -n "$value" ]]; then
       set_env "$var" "$value"
       ok "$var updated"
@@ -797,7 +826,7 @@ configure_bool() {
   [[ "$current" != "yes" ]] || suffix="[Y/n]"
   local value=""
   ask "$prompt $suffix:"
-  read -r value </dev/tty || value=""
+  read_tty value
   if [[ -z "$value" ]]; then
     set_env "$var" "$current"
     ok "$var unchanged ($current)"
@@ -813,7 +842,7 @@ confirm() {
   local prompt="$1" reply=""
   has_tty || return 1
   ask "$prompt [y/N]:"
-  read -r reply </dev/tty || reply=""
+  read_tty reply
   [[ "$reply" =~ ^[Yy] ]]
 }
 
@@ -1226,7 +1255,7 @@ cmd_purge() {
   printf '\n'
   ask "type 'yes' to proceed:"
   local confirm=""
-  read -r confirm </dev/tty || true
+  read_tty confirm
   [[ "$confirm" == "yes" ]] || die "aborted"
 
   header "Stopping service"

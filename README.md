@@ -74,7 +74,9 @@ sudo sing-box-ctl ts status    # State: NeedsLogin → Running once approved
 
 **Pre-auth key** (`TS_AUTH_KEY=`, `--ts-authkey=`): headless, no clicking.
 Get one at <https://login.tailscale.com/admin/settings/keys> — a *reusable,
-pre-approved* key fits a long-lived server.
+pre-approved* key fits a long-lived server. To go back to URL logins,
+answer `-` at the key prompt (plain Enter keeps the current value) or let
+`ts logout` clear it for you.
 
 ### Switching tailnets
 
@@ -97,7 +99,8 @@ secret in `API_SECRET`) that is rendered into `config.json` only while
 `TS_ENABLED=yes` — the login state lives in the running process, not in the
 config. Needs sing-box 1.14.0+.
 
-Optional knobs (all skip-able with a blank prompt):
+Optional knobs (skip with a blank prompt; type `-` at a prompt, or pass
+`SINGBOX_<VAR>=-`, to clear one that already has a value):
 
 - `TS_HOSTNAME` — node name on the tailnet (defaults to the first DNS
   label of `DOMAIN`).
