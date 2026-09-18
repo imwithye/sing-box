@@ -106,11 +106,24 @@ Optional knobs (skip with a blank prompt; type `-` at a prompt, or pass
   label of `DOMAIN`).
 - `TS_EXIT_NODE` — name or `100.x` IP of a tailnet peer to route
   `tailscale-ep` traffic through. Empty means direct peer-to-peer.
-- `/etc/sing-box/tsexit` — extra destinations to route through
-  `tailscale-ep`. One entry per line, `#` for comments. Domains
-  (`netflix.com`, `*.bbc.co.uk`) are suffix-matched; bare IPs become
-  `/32` (v4) or `/128` (v6); CIDRs pass through. Generated empty by
-  `setup`; re-read on every `up`.
+- `/etc/sing-box/tsexit` — extra destinations to **route** through
+  `tailscale-ep`, still resolved by `cloudflare-doh`. One entry per line,
+  `#` for comments. Domains (`netflix.com`, `*.bbc.co.uk`) are
+  suffix-matched; bare IPs become `/32` (v4) or `/128` (v6); CIDRs pass
+  through. This is the file for *public* names you want to leave the
+  tailnet's exit node.
+- `/etc/sing-box/tsdns` — *private* domains to **resolve** through
+  `tailscale-dns` (MagicDNS plus the tailnet's split-DNS resolvers) *and*
+  route through `tailscale-ep`. One suffix-matched domain per line, `#` for
+  comments; IP/CIDR entries are ignored with a warning. This is what a name
+  like `clickplane.clickhouse-staging.com`, whose records only exist inside
+  the tailnet (or point at `*.ts.net` / `100.x`), needs — public DNS has no
+  answer for it, so routing alone is not enough.
+
+Both files are generated empty by `setup` (and created on the next `up` for
+installs that predate them), and re-read on every `up`. Keep public domains
+out of `tsdns`: answering public names from tailnet DNS breaks TLS for sites
+such as Claude — that is exactly why the two lists are separate.
 
 ## Commands
 
@@ -144,6 +157,7 @@ the box (upgrade, retune, restart) is a single command.
 /etc/systemd/system/sing-box.service
 /etc/sing-box/env               secrets (mode 0600)
 /etc/sing-box/tsexit            extra tailscale-ep routes (0600, optional)
+/etc/sing-box/tsdns             private domains via tailnet DNS (0600, optional)
 /etc/sing-box/config.json       rendered sing-box config (0640)
 /etc/sing-box/cache/            ACME certs + sing-box runtime state
 /etc/sing-box/client/           subscription.{txt,b64}

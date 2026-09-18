@@ -15,6 +15,7 @@ CONFIG_DIR="${SINGBOX_CONFIG_DIR:-/etc/sing-box}"
 ENV_FILE="$CONFIG_DIR/env"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 TSEXIT_FILE="$CONFIG_DIR/tsexit"
+TSDNS_FILE="$CONFIG_DIR/tsdns"
 CACHE_DIR="$CONFIG_DIR/cache"
 CLIENT_DIR="$CONFIG_DIR/client"
 UNIT_FILE="/etc/systemd/system/sing-box.service"
@@ -149,21 +150,62 @@ emit_tsexit_template() {
 TPL
 }
 
+emit_tsdns_template() {
+  cat <<'TPL'
+# /etc/sing-box/tsdns — private domains resolved by the tailnet's DNS.
+#
+# Only effective when TS_ENABLED=yes in /etc/sing-box/env.
+#
+# Entries here are resolved through tailscale-dns (MagicDNS plus the tailnet's
+# split-DNS resolvers) instead of cloudflare-doh, and their traffic also
+# egresses through tailscale-ep — which is what a private name whose records
+# point at *.ts.net or 100.x needs to work.
+#
+# Public domains do NOT belong here; put them in /etc/sing-box/tsexit, which
+# only changes routing and leaves resolution on cloudflare-doh. Answering
+# public names from tailnet DNS breaks TLS for sites such as Claude.
+#
+# One domain per line. Comments start with #. Blank lines ignored.
+# Suffix-matched, so an entry also covers its subdomains; "*." is stripped.
+# IP/CIDR entries are ignored — DNS rules match names, not addresses.
+#
+# Re-read at every `sing-box-ctl up`.
+#
+# Examples (uncomment to use):
+# clickplane.clickhouse-staging.com
+# *.corp.example.com
+TPL
+}
+
+# list_entries FILE — prints FILE's meaningful lines: trimmed, with blank
+# lines and #-comments dropped. A missing file prints nothing.
+list_entries() {
+  [[ -f "$1" ]] || return 0
+  local raw entry
+  while IFS= read -r raw || [[ -n "$raw" ]]; do
+    entry="${raw#"${raw%%[![:space:]]*}"}"
+    entry="${entry%"${entry##*[![:space:]]}"}"
+    [[ -z "$entry" || "$entry" == \#* ]] && continue
+    printf '%s\n' "$entry"
+  done < "$1"
+}
+
+# json_array [ITEM...] — the arguments as a JSON string array, "[]" for none.
+json_array() {
+  (( $# > 0 )) || { printf '[]'; return 0; }
+  printf '%s\n' "$@" | jq -R . | jq -s .
+}
+
 # parse_tsexit — splits $TSEXIT_FILE into TSEXIT_DOMAINS / TSEXIT_CIDRS arrays.
 # Missing or all-comment file leaves both empty.
-#   blank lines + #-comments  → skipped
 #   IPv4 (with optional /N)   → CIDRS; bare IP gets /32
 #   IPv6 (with optional /N)   → CIDRS; bare IP gets /128
 #   anything else             → DOMAINS; leading "*." stripped
 parse_tsexit() {
   TSEXIT_DOMAINS=()
   TSEXIT_CIDRS=()
-  [[ -f "$TSEXIT_FILE" ]] || return 0
-  local raw entry
-  while IFS= read -r raw || [[ -n "$raw" ]]; do
-    entry="${raw#"${raw%%[![:space:]]*}"}"
-    entry="${entry%"${entry##*[![:space:]]}"}"
-    [[ -z "$entry" || "$entry" == \#* ]] && continue
+  local entry
+  while IFS= read -r entry; do
     if [[ "$entry" =~ ^[0-9]+(\.[0-9]+){3}(/[0-9]+)?$ ]]; then
       [[ "$entry" == */* ]] || entry="${entry}/32"
       TSEXIT_CIDRS+=("$entry")
@@ -174,7 +216,22 @@ parse_tsexit() {
       [[ "$entry" == \*.* ]] && entry="${entry#\*.}"
       TSEXIT_DOMAINS+=("$entry")
     fi
-  done < "$TSEXIT_FILE"
+  done < <(list_entries "$TSEXIT_FILE")
+}
+
+# parse_tsdns — fills TSDNS_DOMAINS from $TSDNS_FILE. DNS rules match names,
+# so IP/CIDR entries are pointless here and get called out instead of used.
+parse_tsdns() {
+  TSDNS_DOMAINS=()
+  local entry
+  while IFS= read -r entry; do
+    if [[ "$entry" =~ ^[0-9]+(\.[0-9]+){3}(/[0-9]+)?$ || "$entry" == *:* ]]; then
+      warn "$TSDNS_FILE: ignoring '$entry' — DNS rules match domains, not IPs"
+      continue
+    fi
+    [[ "$entry" == \*.* ]] && entry="${entry#\*.}"
+    TSDNS_DOMAINS+=("$entry")
+  done < <(list_entries "$TSDNS_FILE")
 }
 
 emit_config_tpl() {
@@ -558,22 +615,21 @@ patch_config_tailscale() {
   [[ -n "${API_SECRET:-}" ]] || set_env API_SECRET "$(gen_password)"
 
   parse_tsexit
-  local domains_json cidrs_json
-  if (( ${#TSEXIT_DOMAINS[@]} == 0 )); then
-    domains_json='[]'
-  else
-    domains_json=$(printf '%s\n' "${TSEXIT_DOMAINS[@]}" | jq -R . | jq -s .)
-  fi
-  if (( ${#TSEXIT_CIDRS[@]} == 0 )); then
-    cidrs_json='[]'
-  else
-    cidrs_json=$(printf '%s\n' "${TSEXIT_CIDRS[@]}" | jq -R . | jq -s .)
-  fi
+  parse_tsdns
+  local domains_json cidrs_json tsdns_json
+  # ${A[@]+"${A[@]}"} expands to nothing, rather than tripping `set -u`, when
+  # the array is empty — which any of these three usually is.
+  domains_json=$(json_array ${TSEXIT_DOMAINS[@]+"${TSEXIT_DOMAINS[@]}"})
+  cidrs_json=$(json_array ${TSEXIT_CIDRS[@]+"${TSEXIT_CIDRS[@]}"})
+  tsdns_json=$(json_array ${TSDNS_DOMAINS[@]+"${TSDNS_DOMAINS[@]}"})
 
   # Note: tsexit $domains intentionally only patched into route.rules, never
   # dns.rules. Letting public domains resolve via the exit node's tailnet DNS
   # breaks Claude web (TLS errors); cloudflare-doh + tailscale-ep route works.
   # Reconfirmed 2026-05-10 — do not re-add $domains to the DNS rule.
+  # $tsdns (from the tsdns file) is the deliberate opt-in for the other case:
+  # private names whose records only exist inside the tailnet. Those need the
+  # DNS rule *and* the route rule, so they go into both.
   local patched
   patched=$(jq \
     --arg     key       "${TS_AUTH_KEY:-}" \
@@ -585,7 +641,8 @@ patch_config_tailscale() {
     --argjson apiport   "$API_PORT" \
     --arg     apisecret "$API_SECRET" \
     --argjson domains   "$domains_json" \
-    --argjson cidrs     "$cidrs_json" '
+    --argjson cidrs     "$cidrs_json" \
+    --argjson tsdns     "$tsdns_json" '
       .endpoints = ((.endpoints // []) + [
         ({
           type: "tailscale",
@@ -619,11 +676,11 @@ patch_config_tailscale() {
           accept_default_resolvers: true
         }]
       | .dns.rules = ((.dns.rules // []) + [{
-          domain_suffix: ["ts.net"],
+          domain_suffix: (["ts.net"] + $tsdns | unique),
           server: "tailscale-dns"
         }])
       | .route.rules = ([{
-          domain_suffix: (["ts.net"] + $domains),
+          domain_suffix: (["ts.net"] + $domains + $tsdns | unique),
           outbound: "tailscale-ep"
         }, {
           ip_cidr: (["100.64.0.0/10", "fd7a:115c:a1e0::/48"] + $cidrs),
@@ -631,6 +688,26 @@ patch_config_tailscale() {
         }] + (.route.rules // []))
     ' "$CONFIG_FILE")
   printf '%s\n' "$patched" > "$CONFIG_FILE"
+}
+
+# Drops the tsexit / tsdns templates in place when they are missing, so an
+# install that predates either file still finds it documented on disk. Pass
+# any argument to also report files that were already there.
+write_list_templates() {
+  local announce="${1:-}" file
+  mkdir -p "$CONFIG_DIR"
+  for file in "$TSEXIT_FILE" "$TSDNS_FILE"; do
+    if [[ -f "$file" ]]; then
+      [[ -z "$announce" ]] || ok "$file already exists"
+      continue
+    fi
+    case "$file" in
+      "$TSEXIT_FILE") emit_tsexit_template > "$file" ;;
+      "$TSDNS_FILE")  emit_tsdns_template  > "$file" ;;
+    esac
+    chmod 0600 "$file"
+    ok "wrote $file template (empty by default)"
+  done
 }
 
 render_config() {
@@ -645,11 +722,14 @@ render_config() {
     local mode="interactive login"
     [[ -z "${TS_AUTH_KEY:-}" ]] || mode="auth key"
     step "Adding tailscale endpoint (hostname=${TS_HOSTNAME:-${DOMAIN%%.*}}, $mode)"
+    write_list_templates
     patch_config_tailscale
+    ok "tailscale endpoint enabled"
     if (( ${#TSEXIT_DOMAINS[@]} + ${#TSEXIT_CIDRS[@]} > 0 )); then
-      ok "tailscale endpoint enabled (+${#TSEXIT_DOMAINS[@]} domain, ${#TSEXIT_CIDRS[@]} cidr from $TSEXIT_FILE)"
-    else
-      ok "tailscale endpoint enabled"
+      ok "routing +${#TSEXIT_DOMAINS[@]} domain, ${#TSEXIT_CIDRS[@]} cidr from $TSEXIT_FILE"
+    fi
+    if (( ${#TSDNS_DOMAINS[@]} > 0 )); then
+      ok "resolving +${#TSDNS_DOMAINS[@]} domain via tailnet DNS from $TSDNS_FILE"
     fi
   fi
   step "Validating config"
@@ -927,13 +1007,7 @@ cmd_setup() {
   else
     ok "$ENV_FILE already exists"
   fi
-  if [[ ! -f "$TSEXIT_FILE" ]]; then
-    emit_tsexit_template > "$TSEXIT_FILE"
-    chmod 0600 "$TSEXIT_FILE"
-    ok "wrote $TSEXIT_FILE template (empty by default)"
-  else
-    ok "$TSEXIT_FILE already exists"
-  fi
+  write_list_templates announce
   configure_user_vars
   fill_secrets
 
@@ -1339,6 +1413,8 @@ usage() {
   header "Examples"
   hint "curl -fsSL https://raw.githubusercontent.com/imwithye/sing-box/main/install.sh | sudo bash"
   hint "sudo vim $ENV_FILE && sudo sing-box-ctl up"
+  hint "sudo vim $TSEXIT_FILE && sudo sing-box-ctl up   # route public domains via the tailnet"
+  hint "sudo vim $TSDNS_FILE && sudo sing-box-ctl up    # resolve private domains via tailnet DNS"
   hint "sudo sing-box-ctl configure"
   hint "sudo sing-box-ctl ts login      # prints a tailscale login URL"
   hint "sudo sing-box-ctl ts logout     # leave this tailnet, join another"
