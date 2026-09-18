@@ -1016,10 +1016,17 @@ cmd_setup() {
   header "Bringing up service"
   cmd_up
 
-  if ts_enabled && [[ -z "${TS_AUTH_KEY:-}" ]]; then
+  # Whether this node still needs attaching is a property of the running
+  # endpoint, not of the env file — under URL login TS_AUTH_KEY stays empty
+  # forever, so asking it would nag about logging in on every single setup.
+  if ts_enabled; then
     header "Tailscale"
-    hint "no auth key set — attach this node by opening a login URL:"
-    hint "    sudo sing-box-ctl ts login"
+    if ts_wait_ready; then
+      ts_report_auth_url
+    else
+      warn "the tailscale endpoint did not come up"
+      hint "inspect:  sudo sing-box-ctl logs"
+    fi
   fi
 }
 
