@@ -27,6 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/imwithye/sing-box/main/install.sh \
       --email=you@example.com \
       --token=<CLOUDFLARE_API_TOKEN> \
       [--sni=www.apple.com] \
+      [--tailscale] \
       [--ts-authkey=<TAILSCALE_AUTH_KEY>] \
       [--ts-hostname=<TAILNET_HOSTNAME>]
 ```
@@ -51,18 +52,50 @@ cloud)** — sing-box protocols don't pass through Cloudflare's CDN.
 
 ## Optional: Tailscale egress
 
-If you supply a Tailscale pre-auth key (interactive prompt, `--ts-authkey=`
-flag, or `TS_AUTH_KEY=` in `/etc/sing-box/env`), sing-box's built-in
-`tailscale` endpoint joins your tailnet and the rendered config auto-routes:
+Turn it on with `TS_ENABLED=yes` in `/etc/sing-box/env` (the `setup` /
+`configure` prompt, or `--tailscale`). sing-box's built-in `tailscale`
+endpoint then joins your tailnet and the rendered config auto-routes:
 
 - IPv4 `100.64.0.0/10` and IPv6 `fd7a:115c:a1e0::/48` → tailscale endpoint
 - DNS suffix `*.ts.net` (MagicDNS) → tailscale DNS server
 
 So clients connected to sing-box can reach tailnet IPs / MagicDNS names
 transparently. No `tailscaled` is installed — sing-box embeds tsnet
-directly. Get a key at <https://login.tailscale.com/admin/settings/keys>
-(a *reusable, pre-approved* key fits a long-lived server). Skip the prompt
-(blank line) to disable.
+directly.
+
+### Two ways to attach the node
+
+**Login URL** (leave `TS_AUTH_KEY` blank):
+
+```bash
+sudo sing-box-ctl ts login     # prints https://login.tailscale.com/a/...
+sudo sing-box-ctl ts status    # State: NeedsLogin → Running once approved
+```
+
+**Pre-auth key** (`TS_AUTH_KEY=`, `--ts-authkey=`): headless, no clicking.
+Get one at <https://login.tailscale.com/admin/settings/keys> — a *reusable,
+pre-approved* key fits a long-lived server.
+
+### Switching tailnets
+
+```bash
+sudo sing-box-ctl ts logout    # leave the current tailnet, print a new login URL
+```
+
+`logout` deregisters the node upstream, clears `TS_AUTH_KEY` (a key only
+ever works for the tailnet it came from), and immediately offers a fresh
+login URL — so moving from one tailnet to another is one command plus one
+click. The stale node stays listed in the old tailnet's admin console until
+you delete it there.
+
+Only one tailnet at a time: the wrapper renders a single `tailscale-ep`
+endpoint. sing-box itself allows several, but every tailnet shares
+`100.64.0.0/10` and `*.ts.net`, so they can't be told apart by route rules.
+
+These commands talk to a loopback gRPC API service (`127.0.0.1:6756`,
+secret in `API_SECRET`) that is rendered into `config.json` only while
+`TS_ENABLED=yes` — the login state lives in the running process, not in the
+config. Needs sing-box 1.14.0+.
 
 Optional knobs (all skip-able with a blank prompt):
 
@@ -78,19 +111,27 @@ Optional knobs (all skip-able with a blank prompt):
 
 ## Commands
 
-Eight commands, all root-only:
+All root-only:
 
 ```
 setup          install everything (idempotent — also re-pulls the wrapper +
                regenerates only-empty secrets; auto-runs `up` if env is complete)
+configure      re-run the interactive prompts, then re-render + restart
 up             render config + (re)start service
 down           stop service
 logs           journalctl -fu sing-box
 status         systemctl status sing-box
 share [label]  print share links + QR codes; write subscription.{txt,b64}
-upgrade        pull the latest sing-box release + restart
+ts status      tailscale: backend state, tailnet, pending login URL
+ts login       enable + attach this node (prints the login URL)
+ts logout      leave the current tailnet, then offer a new login URL
+upgrade        pull the latest sing-box release, offer the prompts, restart
 purge          tear down the deployment (service + binaries + config + 443 ufw rules)
 ```
+
+`update` is an alias for `upgrade`. Both ask *"review settings now?"* on a
+TTY, which walks the same prompts as `configure` — so the routine visit to
+the box (upgrade, retune, restart) is a single command.
 
 ## On-disk layout
 

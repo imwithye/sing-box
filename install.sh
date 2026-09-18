@@ -17,6 +17,7 @@ DOMAIN_ARG=""
 EMAIL_ARG=""
 TOKEN_ARG=""
 SNI_ARG=""
+TS_ENABLED_ARG=""
 TS_AUTHKEY_ARG=""
 TS_HOSTNAME_ARG=""
 TS_EXIT_NODE_ARG=""
@@ -31,6 +32,8 @@ while [[ $# -gt 0 ]]; do
     --token)          shift; TOKEN_ARG="${1:-}" ;;
     --sni=*)          SNI_ARG="${1#*=}" ;;
     --sni)            shift; SNI_ARG="${1:-}" ;;
+    --tailscale)      TS_ENABLED_ARG="yes" ;;
+    --no-tailscale)   TS_ENABLED_ARG="no" ;;
     --ts-authkey=*)   TS_AUTHKEY_ARG="${1#*=}" ;;
     --ts-authkey)     shift; TS_AUTHKEY_ARG="${1:-}" ;;
     --ts-hostname=*)  TS_HOSTNAME_ARG="${1#*=}" ;;
@@ -48,7 +51,10 @@ Flags (all optional — missing values are prompted for interactively):
   --email=EMAIL          contact email for Let's Encrypt registration
   --token=TOKEN          Cloudflare API token (Zone.DNS:Edit + Zone.Zone:Read)
   --sni=SNI              REALITY camouflage destination (default www.apple.com)
-  --ts-authkey=KEY       Tailscale pre-auth key — enables tailnet egress (optional)
+  --tailscale            enable tailnet egress; without --ts-authkey you attach
+                         the node later via 'sing-box-ctl ts login' (login URL)
+  --no-tailscale         disable tailnet egress without being prompted
+  --ts-authkey=KEY       Tailscale pre-auth key — headless login, implies --tailscale
   --ts-hostname=NAME     Tailnet hostname for this node (optional, defaults to first DNS label)
   --ts-exit-node=NAME    Tailnet exit node name or 100.x IP (optional, blank = direct routing)
 USAGE
@@ -81,6 +87,7 @@ export SINGBOX_DOMAIN="$DOMAIN_ARG"
 export SINGBOX_ACME_EMAIL="$EMAIL_ARG"
 export SINGBOX_CF_API_TOKEN="$TOKEN_ARG"
 export SINGBOX_REALITY_DEST_SNI="$SNI_ARG"
+export SINGBOX_TS_ENABLED="$TS_ENABLED_ARG"
 export SINGBOX_TS_AUTH_KEY="$TS_AUTHKEY_ARG"
 export SINGBOX_TS_HOSTNAME="$TS_HOSTNAME_ARG"
 export SINGBOX_TS_EXIT_NODE="$TS_EXIT_NODE_ARG"

@@ -21,6 +21,12 @@ UNIT_FILE="/etc/systemd/system/sing-box.service"
 SINGBOX_BIN="/usr/local/bin/sing-box"
 WRAPPER_BIN="/usr/local/bin/sing-box-ctl"
 
+# Loopback gRPC API service, rendered only while tailscale is enabled. It is
+# how `ts status/login/logout` reach the running endpoint — the login state
+# lives in the process, not in config.json.
+API_ADDR="${SINGBOX_API_ADDR:-127.0.0.1}"
+API_PORT="${SINGBOX_API_PORT:-6756}"
+
 # ─── pretty output ──────────────────────────────────────────────────────────
 if [[ -t 1 && "${NO_COLOR:-}" == "" ]]; then
   C_RESET=$'\033[0m'   C_DIM=$'\033[2m'    C_BOLD=$'\033[1m'
@@ -38,6 +44,7 @@ warn()    { printf '  %s!%s %s\n' "${C_YELLOW}" "${C_RESET}" "$*"; }
 err()     { printf '  %s✗%s %s\n' "${C_RED}"    "${C_RESET}" "$*" >&2; }
 hint()    { printf '  %s%s%s\n'   "${C_DIM}"    "$*"        "${C_RESET}"; }
 ask()     { printf '  %s?%s %s '  "${C_BLUE}"   "${C_RESET}" "$*"; }
+has_tty() { [[ -e /dev/tty && -r /dev/tty ]]; }
 die()     { err "$*"; exit 1; }
 
 # ─── prerequisites ──────────────────────────────────────────────────────────
@@ -78,12 +85,20 @@ REALITY_DEST_SNI=www.apple.com
 REALITY_DEST_PORT=443
 
 # ---- Tailscale (optional) ------------------------------------------------
-# If TS_AUTH_KEY is set, sing-box exposes its built-in tailscale endpoint and
-# auto-routes 100.64.0.0/10, fd7a:115c:a1e0::/48, and *.ts.net through it —
-# clients connected to sing-box can reach your tailnet. Leave empty to skip.
+# TS_ENABLED=yes exposes sing-box's built-in tailscale endpoint and auto-routes
+# 100.64.0.0/10, fd7a:115c:a1e0::/48, and *.ts.net through it — clients
+# connected to sing-box can reach your tailnet. Anything else disables it.
+TS_ENABLED=no
+
+# Login mode:
+#   TS_AUTH_KEY set   → headless login, no interaction needed.
+#   TS_AUTH_KEY blank → `sing-box-ctl ts login` prints a URL to open.
 #
 # Pre-auth key: https://login.tailscale.com/admin/settings/keys
 # (a "Reusable, pre-approved" key is the typical fit for a server node)
+#
+# A key is tailnet-scoped, so `sing-box-ctl ts logout` clears it — otherwise
+# the next restart would silently log back into the tailnet you just left.
 TS_AUTH_KEY=
 
 # Tailnet hostname for this node. Empty falls back to the first DNS label of
@@ -102,6 +117,10 @@ REALITY_PUBLIC_KEY=
 REALITY_SHORT_ID=
 HYSTERIA2_PASSWORD=
 HYSTERIA2_OBFS_PASSWORD=
+
+# Secret for the loopback gRPC API service. Generated on first render with
+# TS_ENABLED=yes; unused (and the service unrendered) while tailscale is off.
+API_SECRET=
 TPL
 }
 
@@ -109,7 +128,7 @@ emit_tsexit_template() {
   cat <<'TPL'
 # /etc/sing-box/tsexit — additional destinations to route through tailscale-ep.
 #
-# Only effective when TS_AUTH_KEY is set in /etc/sing-box/env.
+# Only effective when TS_ENABLED=yes in /etc/sing-box/env.
 # When TS_EXIT_NODE is also set, matched traffic egresses through that
 # tailnet peer; otherwise it goes via direct tsnet routing.
 #
@@ -308,6 +327,25 @@ set_env() {
   export "$key=$val"
 }
 
+# Truthy test for TS_ENABLED. Installs predating that key have no such line;
+# there, a non-empty TS_AUTH_KEY was what turned tailscale on, so honour it.
+ts_enabled() {
+  local v="${TS_ENABLED:-}"
+  if [[ -z "$v" ]]; then
+    [[ -n "${TS_AUTH_KEY:-}" ]]
+    return
+  fi
+  norm_bool "$v" | grep -qx yes
+}
+
+# Normalises a human yes/no answer to exactly "yes" or "no".
+norm_bool() {
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in
+    y|yes|true|on|1) printf 'yes' ;;
+    *)               printf 'no'  ;;
+  esac
+}
+
 require_vars() {
   local missing=0 v
   for v in "$@"; do
@@ -488,9 +526,10 @@ setup_ufw() {
 }
 
 # ─── render config ──────────────────────────────────────────────────────────
-# Patch the rendered config to add a tailscale endpoint, DNS server, and
-# route rule. Activated only when TS_AUTH_KEY is non-empty. Hostname falls
-# back to the first DNS label of DOMAIN.
+# Patch the rendered config to add a tailscale endpoint, DNS server, route
+# rule, and the loopback API service the `ts` subcommands drive. Activated
+# only when TS_ENABLED is truthy. Hostname falls back to the first DNS label
+# of DOMAIN.
 patch_config_tailscale() {
   require_cmd jq
   local host="${TS_HOSTNAME:-${DOMAIN%%.*}}" state="$CACHE_DIR/tailscale"
@@ -499,6 +538,17 @@ patch_config_tailscale() {
   # ProtectSystem=strict — pin it inside the cache dir instead.
   local taildrop="$state/Taildrop"
   mkdir -p "$state" "$taildrop"
+
+  # The API service — and so the `ts` subcommands — needs sing-box 1.14.0+.
+  local installed
+  installed="$(installed_version)"
+  if [[ -n "$installed" ]] \
+     && [[ "$(printf '%s\n' 1.14.0 "$installed" | sort -V | head -1)" != "1.14.0" ]]; then
+    die "tailscale support needs sing-box 1.14.0+ (installed: $installed) — run 'sing-box-ctl upgrade'"
+  fi
+
+  # Gates loopback access to the control API; generated once, then reused.
+  [[ -n "${API_SECRET:-}" ]] || set_env API_SECRET "$(gen_password)"
 
   parse_tsexit
   local domains_json cidrs_json
@@ -519,24 +569,42 @@ patch_config_tailscale() {
   # Reconfirmed 2026-05-10 — do not re-add $domains to the DNS rule.
   local patched
   patched=$(jq \
-    --arg     key     "$TS_AUTH_KEY" \
-    --arg     host    "$host" \
-    --arg     state   "$state" \
-    --arg     taildrop "$taildrop" \
-    --arg     exit    "${TS_EXIT_NODE:-}" \
-    --argjson domains "$domains_json" \
-    --argjson cidrs   "$cidrs_json" '
+    --arg     key       "${TS_AUTH_KEY:-}" \
+    --arg     host      "$host" \
+    --arg     state     "$state" \
+    --arg     taildrop  "$taildrop" \
+    --arg     exit      "${TS_EXIT_NODE:-}" \
+    --arg     apiaddr   "$API_ADDR" \
+    --argjson apiport   "$API_PORT" \
+    --arg     apisecret "$API_SECRET" \
+    --argjson domains   "$domains_json" \
+    --argjson cidrs     "$cidrs_json" '
       .endpoints = ((.endpoints // []) + [
         ({
           type: "tailscale",
           tag: "tailscale-ep",
-          auth_key: $key,
           hostname: $host,
           state_directory: $state,
           taildrop_directory: $taildrop,
           ephemeral: false
-        } + (if $exit == "" then {} else {exit_node: $exit} end))
+        }
+        # Omitting auth_key entirely (not setting it empty) is what selects
+        # interactive login: sing-box then waits for the URL that
+        # `sing-box-ctl ts login` surfaces.
+        + (if $key  == "" then {} else {auth_key:  $key}  end)
+        + (if $exit == "" then {} else {exit_node: $exit} end))
       ])
+      # Loopback-only control API — how ts status/login/logout reach the
+      # endpoint. dashboard:false matters: the default downloads the web
+      # dashboard from GitHub on every start.
+      | .services = ((.services // []) + [{
+          type: "api",
+          tag: "api",
+          listen: $apiaddr,
+          listen_port: $apiport,
+          secret: $apisecret,
+          dashboard: false
+        }])
       | .dns.servers += [{
           tag: "tailscale-dns",
           type: "tailscale",
@@ -566,8 +634,10 @@ render_config() {
   ACME_DATA_DIR="$CACHE_DIR/acme" \
     envsubst < <(emit_config_tpl) > "$CONFIG_FILE"
   chmod 0600 "$CONFIG_FILE"
-  if [[ -n "${TS_AUTH_KEY:-}" ]]; then
-    step "Adding tailscale endpoint (hostname=${TS_HOSTNAME:-${DOMAIN%%.*}})"
+  if ts_enabled; then
+    local mode="interactive login"
+    [[ -z "${TS_AUTH_KEY:-}" ]] || mode="auth key"
+    step "Adding tailscale endpoint (hostname=${TS_HOSTNAME:-${DOMAIN%%.*}}, $mode)"
     patch_config_tailscale
     if (( ${#TSEXIT_DOMAINS[@]} + ${#TSEXIT_CIDRS[@]} > 0 )); then
       ok "tailscale endpoint enabled (+${#TSEXIT_DOMAINS[@]} domain, ${#TSEXIT_CIDRS[@]} cidr from $TSEXIT_FILE)"
@@ -618,15 +688,29 @@ configure_user_vars() {
     "Cloudflare API token (Zone.DNS:Edit + Zone.Zone:Read)"
   configure_var REALITY_DEST_SNI optional \
     "REALITY camouflage destination"
-  configure_var TS_AUTH_KEY      optional \
-    "Tailscale auth key — enables tailnet egress (blank to skip)"
-  # set_env exports, so TS_AUTH_KEY/DOMAIN are visible here without re-sourcing.
-  if [[ -n "${TS_AUTH_KEY:-}" ]]; then
-    configure_var TS_HOSTNAME    optional \
-      "Tailnet hostname (defaults to ${DOMAIN%%.*} if blank)"
-    configure_var TS_EXIT_NODE   optional \
-      "Tailscale exit node name or 100.x IP (blank for direct routing)"
+
+  # install.sh only ever passes --ts-authkey when tailnet egress is wanted.
+  if [[ -z "${SINGBOX_TS_ENABLED:-}" && -n "${SINGBOX_TS_AUTH_KEY:-}" ]]; then
+    export SINGBOX_TS_ENABLED=yes
   fi
+  local ts_default=no
+  ts_enabled && ts_default=yes
+  configure_bool TS_ENABLED "Enable the Tailscale endpoint?" "$ts_default"
+  # set_env exports, so TS_ENABLED/TS_AUTH_KEY/DOMAIN are visible here
+  # without re-sourcing.
+  if ts_enabled; then
+    configure_tailscale_vars
+  fi
+}
+
+# The three tailnet knobs, shared by `setup`/`configure` and `ts login`.
+configure_tailscale_vars() {
+  configure_var TS_AUTH_KEY    optional \
+    "Tailscale pre-auth key (blank = log in via URL)"
+  configure_var TS_HOSTNAME    optional \
+    "Tailnet hostname (defaults to ${DOMAIN%%.*} if blank)"
+  configure_var TS_EXIT_NODE   optional \
+    "Tailscale exit node name or 100.x IP (blank for direct routing)"
 }
 
 # configure_var VARNAME required|optional PROMPT_TEXT
@@ -652,7 +736,7 @@ configure_var() {
 
   local current="${!var:-}"
 
-  if [[ ! -e /dev/tty || ! -r /dev/tty ]]; then
+  if ! has_tty; then
     [[ "$mode" == "required" && -z "$current" ]] \
       && die "$var is empty and no TTY for prompt — set $fb_var or rerun on a TTY"
     return 0
@@ -684,15 +768,57 @@ configure_var() {
   done
 }
 
-# Returns 0 if the user interactively confirms regenerating $1.
-# Returns 1 (no regen) when there's no TTY or the answer isn't y/Y.
-confirm_regen() {
-  local name="$1" reply=""
-  [[ -e /dev/tty && -r /dev/tty ]] || return 1
-  ask "regenerate $name? [y/N]:"
+# configure_bool VARNAME PROMPT_TEXT [DEFAULT]
+#
+# configure_var for yes/no values: same SINGBOX_<VAR> override and TTY rules,
+# but the stored value is normalised to exactly "yes" or "no". DEFAULT applies
+# only when the var is unset or empty in $ENV_FILE.
+configure_bool() {
+  local var="$1" prompt="$2" fallback="${3:-no}"
+
+  local fb_var="SINGBOX_${var}"
+  local fb="${!fb_var:-}"
+  if [[ -n "$fb" ]]; then
+    set_env "$var" "$(norm_bool "$fb")"
+    ok "$var ← ${!var} (from \$$fb_var)"
+    return 0
+  fi
+
+  local current="${!var:-}"
+  [[ -n "$current" ]] || current="$fallback"
+  current="$(norm_bool "$current")"
+
+  if ! has_tty; then
+    set_env "$var" "$current"
+    return 0
+  fi
+
+  local suffix="[y/N]"
+  [[ "$current" != "yes" ]] || suffix="[Y/n]"
+  local value=""
+  ask "$prompt $suffix:"
+  read -r value </dev/tty || value=""
+  if [[ -z "$value" ]]; then
+    set_env "$var" "$current"
+    ok "$var unchanged ($current)"
+    return 0
+  fi
+  set_env "$var" "$(norm_bool "$value")"
+  ok "$var = ${!var}"
+}
+
+# Returns 0 if the user answers y/Y to $1. Answering nothing, or having no
+# TTY, means no.
+confirm() {
+  local prompt="$1" reply=""
+  has_tty || return 1
+  ask "$prompt [y/N]:"
   read -r reply </dev/tty || reply=""
   [[ "$reply" =~ ^[Yy] ]]
 }
+
+# Returns 0 if the user interactively confirms regenerating $1.
+confirm_regen() { confirm "regenerate $1?"; }
 
 # maybe_regen NAME GENERATOR — generate if empty, prompt to regen otherwise.
 maybe_regen() {
@@ -714,7 +840,7 @@ fill_secrets() {
   local v
   for v in VLESS_UUID REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY \
            REALITY_SHORT_ID HYSTERIA2_PASSWORD HYSTERIA2_OBFS_PASSWORD; do
-    if [[ -n "${!v:-}" ]] && [[ -e /dev/tty && -r /dev/tty ]]; then
+    if [[ -n "${!v:-}" ]] && has_tty; then
       warn "regenerating any secret invalidates every client still using the old value"
       break
     fi
@@ -786,6 +912,176 @@ cmd_setup() {
   # re-check before bringing the service up.
   header "Bringing up service"
   cmd_up
+
+  if ts_enabled && [[ -z "${TS_AUTH_KEY:-}" ]]; then
+    header "Tailscale"
+    hint "no auth key set — attach this node by opening a login URL:"
+    hint "    sudo sing-box-ctl ts login"
+  fi
+}
+
+# ─── tailscale login state ──────────────────────────────────────────────────
+# A tailnet login lives inside the running sing-box process (and its state
+# directory), not in config.json — so every `ts` action talks to the loopback
+# gRPC API that patch_config_tailscale renders next to the endpoint.
+ts_api() {
+  BOX_API_URL="${API_ADDR}:${API_PORT}" BOX_API_SECRET="${API_SECRET:-}" \
+    timeout 15 "$SINGBOX_BIN" api tailscale "$@"
+}
+
+# `sing-box api tailscale status` prints "  <Label>:   <value>" lines.
+ts_state()    { ts_api status 2>/dev/null | sed -n 's/^ *State: *//p'; }
+ts_auth_url() { ts_api status 2>/dev/null | sed -n 's/^ *Log in: *//p'; }
+
+# Configs rendered before the API service existed have no listener to talk to;
+# re-render (which restarts) instead of failing with a connection error.
+ts_ensure_api_service() {
+  require_cmd jq
+  [[ -f "$CONFIG_FILE" ]] || die "$CONFIG_FILE not found — run 'sing-box-ctl up' first"
+  if ! jq -e '[.services[]? | select(.type == "api")] | length > 0' \
+       "$CONFIG_FILE" >/dev/null 2>&1; then
+    step "Config predates the control API — re-rendering"
+    cmd_up
+  elif ! systemctl is-active --quiet sing-box; then
+    cmd_up
+  fi
+}
+
+# The endpoint answers the API only once it has finished starting.
+ts_wait_ready() {
+  local i
+  for i in {1..60}; do
+    [[ -z "$(ts_state)" ]] || return 0
+    sleep 1
+  done
+  return 1
+}
+
+# Prints a pending login URL on stdout. Exit 1 = already logged in,
+# 2 = neither happened before the timeout.
+ts_wait_auth() {
+  local i url
+  for i in {1..90}; do
+    url="$(ts_auth_url)"
+    if [[ -n "$url" ]]; then
+      printf '%s\n' "$url"
+      return 0
+    fi
+    [[ "$(ts_state)" != "Running" ]] || return 1
+    sleep 1
+  done
+  return 2
+}
+
+ts_report_auth_url() {
+  step "Waiting for a login URL"
+  local url="" rc=0
+  url="$(ts_wait_auth)" || rc=$?
+  case "$rc" in
+    0)
+      ok "open this URL to attach the node to a tailnet:"
+      printf '\n    %s\n\n' "$url"
+      hint "the node stays NeedsLogin until the URL is opened and approved"
+      hint "check in on it:  sudo sing-box-ctl ts status"
+      ;;
+    1) ok "node is logged in (state: Running)" ;;
+    *)
+      warn "no login URL surfaced within 90s"
+      hint "inspect:  sudo sing-box-ctl ts status"
+      hint "          sudo sing-box-ctl logs"
+      ;;
+  esac
+}
+
+ts_status() {
+  load_env
+  if ! ts_enabled; then
+    warn "tailscale is disabled (TS_ENABLED=${TS_ENABLED:-no})"
+    hint "turn it on:  sudo sing-box-ctl ts login"
+    return 0
+  fi
+  ts_ensure_api_service
+  header "Tailscale"
+  ts_api status \
+    || die "could not reach the sing-box API on ${API_ADDR}:${API_PORT} — try 'sudo sing-box-ctl up'"
+}
+
+# Enables + configures tailscale if needed, then surfaces the login URL.
+# Idempotent: an already-logged-in node just reports Running.
+ts_login() {
+  load_env
+  if ! ts_enabled; then
+    header "Enabling tailscale"
+    set_env TS_ENABLED yes
+    configure_tailscale_vars
+    cmd_up
+  else
+    ts_ensure_api_service
+  fi
+
+  header "Tailscale login"
+  ts_wait_ready || die "the tailscale endpoint did not come up — see 'sudo sing-box-ctl logs'"
+  if [[ "$(ts_state)" == "Running" ]]; then
+    ok "already logged in"
+    ts_api status || true
+    hint "switch tailnets:  sudo sing-box-ctl ts logout"
+    return 0
+  fi
+  if [[ -n "${TS_AUTH_KEY:-}" ]]; then
+    hint "TS_AUTH_KEY is set — login is headless; clear it to log in by URL"
+  fi
+  ts_report_auth_url
+}
+
+# Leaves the current tailnet and immediately offers a fresh login URL, so
+# "log out of A, log in to B" is one command plus one click.
+ts_logout() {
+  load_env
+  ts_enabled || die "tailscale is disabled — nothing to log out of"
+  ts_ensure_api_service
+
+  header "Tailscale logout"
+  hint "the node leaves its current tailnet; a fresh login URL follows"
+  if has_tty; then
+    confirm "log out of the current tailnet?" || die "aborted"
+  fi
+
+  # A pre-auth key belongs to the tailnet being left — drop it before logging
+  # out, or the next restart silently logs back into that same tailnet.
+  if [[ -n "${TS_AUTH_KEY:-}" ]]; then
+    step "Clearing TS_AUTH_KEY (it is scoped to the tailnet you are leaving)"
+    set_env TS_AUTH_KEY ""
+    render_config
+    step "Restarting sing-box"
+    systemctl restart sing-box
+  fi
+
+  ts_wait_ready || die "the tailscale endpoint did not come up — see 'sudo sing-box-ctl logs'"
+  step "Logging out"
+  # The endpoint answers status a moment before it accepts a logout, so give
+  # it a few tries before treating the refusal as real.
+  local i logged_out=0
+  for i in {1..10}; do
+    if ts_api logout; then
+      logged_out=1
+      break
+    fi
+    sleep 1
+  done
+  (( logged_out )) || die "logout failed — inspect 'sudo sing-box-ctl ts status'"
+  ok "logged out"
+  hint "the old node lingers in that tailnet's admin console — delete it there"
+  ts_report_auth_url
+}
+
+cmd_ts() {
+  require_root ts
+  case "${1:-status}" in
+    status) ts_status ;;
+    login)  ts_login  ;;
+    logout) ts_logout ;;
+    *)      die "unknown 'ts' action: $1 (want status, login or logout)" ;;
+  esac
 }
 
 cmd_up() {
@@ -863,9 +1159,18 @@ cmd_share() {
   hint "then point Shadowrocket → Subscribe at the file's Raw URL."
 }
 
+# Re-walk the interactive prompts without redoing the host prep `setup` does.
+cmd_configure() {
+  require_root configure
+  [[ -f "$ENV_FILE" ]] || die "$ENV_FILE not found — run 'sing-box-ctl setup' first"
+  header "Configuring $ENV_FILE"
+  configure_user_vars
+  cmd_up
+}
+
 cmd_upgrade() {
   require_root upgrade
-  local current latest
+  local current latest upgraded=0
   current="$(installed_version)"
   latest="$(latest_version)"
   header "sing-box upgrade"
@@ -873,10 +1178,20 @@ cmd_upgrade() {
   ok "latest:  $latest"
   if [[ "$current" == "$latest" ]]; then
     ok "already up to date"
+  else
+    install_singbox_binary "$latest"
+    upgraded=1
+  fi
+
+  # An upgrade is when people are on the box anyway, so offer the prompts —
+  # re-rendering the config is wanted after a version bump regardless.
+  if [[ -f "$ENV_FILE" ]] && confirm "review settings now?"; then
+    header "Configuring $ENV_FILE"
+    configure_user_vars
+    cmd_up
     return 0
   fi
-  install_singbox_binary "$latest"
-  if systemctl is-active --quiet sing-box; then
+  if (( upgraded )) && systemctl is-active --quiet sing-box; then
     step "Restarting sing-box"
     systemctl restart sing-box
     ok "restarted"
@@ -907,7 +1222,7 @@ cmd_purge() {
   hint "    /etc/sysctl.d/99-bbr.conf, tcp_bbr module"
   hint "    ufw + qrencode + jq apt packages"
 
-  [[ -e /dev/tty && -r /dev/tty ]] || die "purge needs a TTY for confirmation"
+  has_tty || die "purge needs a TTY for confirmation"
   printf '\n'
   ask "type 'yes' to proceed:"
   local confirm=""
@@ -979,12 +1294,14 @@ usage() {
 
   header "Commands"
   row "setup"          "Install everything: BBR, apt deps (ufw + qrencode + jq), UFW rules, sing-box binary, unit, wrapper, secrets"
+  row "configure"      "Re-run the interactive prompts, then re-render + restart"
   row "up"             "Render config + (re)start service"
   row "down"           "Stop service"
   row "logs"           "journalctl -fu sing-box"
   row "status"         "systemctl status sing-box"
   row "share [label]"  "Print share links + QR codes; write subscription.{txt,b64}"
-  row "upgrade"        "Pull latest sing-box release + restart"
+  row "ts <action>"    "Tailscale: status | login (prints the login URL) | logout (leave tailnet, then offer a new URL)"
+  row "upgrade"        "Pull latest sing-box release, offer the prompts, restart"
   row "purge"          "Remove service, binaries, config, secrets, 443 ufw rules"
 
   header "Paths"
@@ -993,19 +1310,24 @@ usage() {
   header "Examples"
   hint "curl -fsSL https://raw.githubusercontent.com/imwithye/sing-box/main/install.sh | sudo bash"
   hint "sudo vim $ENV_FILE && sudo sing-box-ctl up"
+  hint "sudo sing-box-ctl configure"
+  hint "sudo sing-box-ctl ts login      # prints a tailscale login URL"
+  hint "sudo sing-box-ctl ts logout     # leave this tailnet, join another"
   hint "sudo sing-box-ctl share MY-SG"
   printf '\n'
 }
 
 main() {
   case "${1:-}" in
-    setup)              shift; cmd_setup   "$@" ;;
+    setup)              shift; cmd_setup     "$@" ;;
+    configure|config)   shift; cmd_configure "$@" ;;
+    ts|tailscale)       shift; cmd_ts        "$@" ;;
     up)                 shift; cmd_up      "$@" ;;
     down)               shift; cmd_down    "$@" ;;
     logs)               shift; cmd_logs    "$@" ;;
     status)             shift; cmd_status  "$@" ;;
     share)              shift; cmd_share   "$@" ;;
-    upgrade)            shift; cmd_upgrade "$@" ;;
+    upgrade|update)     shift; cmd_upgrade "$@" ;;
     purge)              shift; cmd_purge   "$@" ;;
     ""|-h|--help|help)  usage ;;
     *)                  usage; exit 1 ;;
